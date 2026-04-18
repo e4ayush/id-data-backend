@@ -313,6 +313,22 @@ async def get_students_mobile(school_id: str = Depends(verify_school_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/mobile/student/{student_id}")
+async def delete_student_mobile(student_id: str, school_id: str = Depends(verify_school_user)):
+    try:
+        # Extra security: delete ONLY if the student belongs to the passed in school_id! (RLS usually does this, but safely fallback)
+        response = supabase.table("students").delete().eq("id", student_id).eq("school_id", school_id).execute()
+        
+        # If response data is empty, either the student didn't exist or didn't belong to the school
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Student not found or unauthorized")
+        
+        return {"message": "Student deleted successfully"}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.put("/mobile/update-student/{student_id}")
 async def update_student_mobile(student_id: str, update_data: dict, school_id: str = Depends(verify_school_user)):
     try:
