@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import os
 from pydantic import BaseModel
@@ -31,6 +31,27 @@ def verify_admin(request: Request):
     token = request.headers.get("X-Admin-Secret")
     if token != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+def verify_school_user(authorization: str = Header(...)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    token = authorization.split(" ")[1]
+
+    try:
+        user_resp = supabase.auth.get_user(token)
+        if not user_resp or not user_resp.user:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        metadata = user_resp.user.user_metadata
+        school_id = metadata.get("school_id")
+
+        if not school_id:
+            raise HTTPException(status_code=403, detail="No school assigned")
+
+        return school_id
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 class SchoolCreate(BaseModel):
     name: str
@@ -225,16 +246,29 @@ async def upload_photo(student_id: str, file: UploadFile = File(...), request: R
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# We accept a raw dictionary so the Flutter app can send 1 field or 10 fields to update
-# TODO: add JWT verification from Supabase Auth before Flutter launch
-@app.put("/mobile/update-student/{student_id}")
-async def update_student_mobile(student_id: str, update_data: dict):
+# ---------------------------------------------------------
+# MOBILE APP ROUTES (Protected by Supabase JWT)
+# ---------------------------------------------------------
+
+@app.get("/mobile/students")
+async def get_students_mobile(school_id: str = Depends(verify_school_user)):
     try:
-        # Example flutter request body: {"name": "Ayush Verman", "roll_number": "42"}
-        
+        response = supabase.table("students").select("*").eq("school_id", school_id).order("name").execute()
+        return {"data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/mobile/update-student/{student_id}")
+async def update_student_mobile(student_id: str, update_data: dict, school_id: str = Depends(verify_school_user)):
+    try:
+        # First, ensure this student actually belongs to the caller's school
+        check = supabase.table("students").select("school_id").eq("id", student_id).single().execute()
+        if not check.data or check.data["school_id"] != school_id:
+            raise HTTPException(status_code=403, detail="Unauthorized access to student")
+
         # Security: Prevent them from accidentally updating the ID or School ID
-        if "id" in update_data: del update_data["id"]
-        if "school_id" in update_data: del update_data["school_id"]
+        update_data.pop("id", None)
+        update_data.pop("school_id", None)
 
         # Push the changes directly to Supabase
         response = supabase.table("students").update(update_data).eq("id", student_id).execute()
@@ -243,6 +277,74 @@ async def update_student_mobile(student_id: str, update_data: dict):
             "message": "Student updated successfully", 
             "data": response.data
         }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/mobile/upload-photo/{student_id}")
+async def upload_photo_mobile(student_id: str, file: UploadFile = File(...), school_id: str = Depends(verify_school_user)):
+    # 1. Ensure ownership
+    check = supabase.table("students").select("school_id").eq("id", student_id).single().execute()
+    if not check.data or check.data["school_id"] != school_id:
+        raise HTTPException(status_code=403, detail="Unauthorized access to student")
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    try:
+        contents = await file.read()
+        file_extension = file.filename.split(".")[-1]
+        unique_filename = f"{student_id}_{uuid.uuid4().hex}.{file_extension}"
+        
+        supabase.storage.from_("student-photos").upload(
+            file=contents,
+            path=unique_filename,
+            file_options={"content-type": file.content_type}
+        )
+        
+        public_url = supabase.storage.from_("student-photos").get_public_url(unique_filename)
+        supabase.table("students").update({"photo_url": public_url}).eq("id", student_id).execute()
+        
+        return {"message": "Photo uploaded successfully!", "photo_url": public_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/mobile/sync")
+async def sync_data(payload: dict, school_id: str = Depends(verify_school_user)):
+    updates = payload.get("updates", [])
+    creates = payload.get("creates", [])
+    deletes = payload.get("deletes", [])
+
+    try:
+        for u in updates:
+            # Pop the ID for the update body, but keep it for the filter
+            student_id = u.pop("id", None)
+            if not student_id: continue
+            
+            supabase.table("students") \
+                .update(u) \
+                .eq("id", student_id) \
+                .eq("school_id", school_id) \
+                .execute()
+
+        for c in creates:
+            c["school_id"] = school_id
+            # Remove ID if present in creation to let DB generate it
+            c.pop("id", None) 
+            supabase.table("students").insert(c).execute()
+
+        for d in deletes:
+            student_id = d.get("id")
+            if not student_id: continue
+            
+            supabase.table("students") \
+                .delete() \
+                .eq("id", student_id) \
+                .eq("school_id", school_id) \
+                .execute()
+
+        return {"message": "Sync complete"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
