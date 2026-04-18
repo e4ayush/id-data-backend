@@ -241,7 +241,19 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 
                 if normalized in field_map:
                     # Maps to a real DB column
-                    student[field_map[normalized]] = str(value).strip()
+                    col_name = field_map[normalized]
+                    val_str = str(value).strip()
+                    
+                    if col_name == "dob" and val_str:
+                        try:
+                            # Pass dayfirst=True to handle DD-MM-YYYY natively
+                            parsed_date = pd.to_datetime(val_str, dayfirst=True).strftime("%Y-%m-%d")
+                            student[col_name] = parsed_date
+                        except Exception:
+                            # If for whatever reason it fails to parse, pass raw string
+                            student[col_name] = val_str
+                    else:
+                        student[col_name] = val_str
                 else:
                     # Truly unknown column — goes to custom_data
                     student["custom_data"][original_key] = str(value).strip()
