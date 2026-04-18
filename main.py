@@ -298,43 +298,57 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
         #   - If no match → INSERT as new
         # For students WITHOUT admission_number → INSERT as new
         #
-        # Students in DB that are NOT in the new sheet AND have an admission_number
-        # → assumed transferred/left → DELETE them
-        # Students in DB without admission_number are NEVER auto-deleted (too risky)
-        # ─────────────────────────────────────────────────────────────────
-
+        # ── Bulletproof Overwrite Strategy ────────────────────────────────
         # Fetch existing students for this school
-        existing = supabase.table("students").select("id, admission_number, photo_url").eq("school_id", school_id).execute()
-        existing_by_adm = {r["admission_number"]: r for r in existing.data if r.get("admission_number")}
-
-        new_adm_numbers = {s["admission_number"] for s in student_data if s.get("admission_number")}
+        existing = supabase.table("students").select("id, name, class, admission_number, photo_url").eq("school_id", school_id).execute()
+        existing_data = existing.data or []
+        
+        # Build lookup maps
+        by_adm = {r["admission_number"]: r for r in existing_data if r.get("admission_number")}
+        by_name_class = {f"{str(r['name']).lower().strip()}|{str(r['class']).lower().strip()}": r for r in existing_data}
 
         inserted = 0
         updated = 0
-        removed = 0
+        current_sheet_ids = set()
 
         for student in student_data:
+            match = None
             adm = student.get("admission_number")
-            if adm and adm in existing_by_adm:
-                # UPDATE existing — Supabase keeps photo_url untouched
-                existing_id = existing_by_adm[adm]["id"]
-                student.pop("school_id", None)  # Can't update these
-                supabase.table("students").update(student).eq("id", existing_id).execute()
+            name_key = f"{str(student.get('name')).lower().strip()}|{str(student.get('class')).lower().strip()}"
+            
+            # 1. Match by Admission Number (Highest priority)
+            if adm and adm in by_adm:
+                match = by_adm[adm]
+            # 2. Fallback: Match by Name + Class
+            elif name_key in by_name_class:
+                match = by_name_class[name_key]
+            
+            if match:
+                # OVERWRITE / UPDATE
+                student.pop("school_id", None) # Security
+                supabase.table("students").update(student).eq("id", match["id"]).execute()
+                current_sheet_ids.add(match["id"])
                 updated += 1
             else:
-                # INSERT new
+                # INSERT NEW
                 student["school_id"] = school_id
-                supabase.table("students").insert(student).execute()
+                res = supabase.table("students").insert(student).execute()
+                if res.data:
+                    current_sheet_ids.add(res.data[0]["id"])
                 inserted += 1
 
-        # Remove students whose admission_number is no longer in the sheet
-        for adm, record in existing_by_adm.items():
-            if adm not in new_adm_numbers:
-                supabase.table("students").delete().eq("id", record["id"]).execute()
+        # 3. CLEANUP: Delete students who are NOT in the latest sheet
+        all_existing_ids = {r["id"] for r in existing_data}
+        ids_to_remove = all_existing_ids - current_sheet_ids
+        
+        removed = 0
+        if ids_to_remove:
+            for rid in ids_to_remove:
+                supabase.table("students").delete().eq("id", rid).execute()
                 removed += 1
 
         return {
-            "message": f"Upload complete: {inserted} added, {updated} updated, {removed} removed.",
+            "message": f"Sync complete: {updated} updated, {inserted} added, {removed} removed.",
             "inserted": inserted,
             "updated": updated,
             "removed": removed,
