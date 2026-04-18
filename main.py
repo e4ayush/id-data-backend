@@ -257,11 +257,56 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
 
             student_data.append(student)
 
-        # Wipe existing students for this school first, then insert fresh
-        supabase.table("students").delete().eq("school_id", school_id).execute()
-        response = supabase.table("students").insert(student_data).execute()
+        # ── Safe Upsert Strategy ──────────────────────────────────────────
+        # Split students into those with an admission_number (can be matched)
+        # and those without (must be inserted fresh).
+        #
+        # For students WITH admission_number:
+        #   - If the school already has a matching record → UPDATE it (keeps photo!)
+        #   - If no match → INSERT as new
+        # For students WITHOUT admission_number → INSERT as new
+        #
+        # Students in DB that are NOT in the new sheet AND have an admission_number
+        # → assumed transferred/left → DELETE them
+        # Students in DB without admission_number are NEVER auto-deleted (too risky)
+        # ─────────────────────────────────────────────────────────────────
 
-        return {"message": f"Dynamically uploaded {len(student_data)} students!", "data": response.data}
+        # Fetch existing students for this school
+        existing = supabase.table("students").select("id, admission_number, photo_url").eq("school_id", school_id).execute()
+        existing_by_adm = {r["admission_number"]: r for r in existing.data if r.get("admission_number")}
+
+        new_adm_numbers = {s["admission_number"] for s in student_data if s.get("admission_number")}
+
+        inserted = 0
+        updated = 0
+        removed = 0
+
+        for student in student_data:
+            adm = student.get("admission_number")
+            if adm and adm in existing_by_adm:
+                # UPDATE existing — Supabase keeps photo_url untouched
+                existing_id = existing_by_adm[adm]["id"]
+                student.pop("school_id", None)  # Can't update these
+                supabase.table("students").update(student).eq("id", existing_id).execute()
+                updated += 1
+            else:
+                # INSERT new
+                student["school_id"] = school_id
+                supabase.table("students").insert(student).execute()
+                inserted += 1
+
+        # Remove students whose admission_number is no longer in the sheet
+        for adm, record in existing_by_adm.items():
+            if adm not in new_adm_numbers:
+                supabase.table("students").delete().eq("id", record["id"]).execute()
+                removed += 1
+
+        return {
+            "message": f"Upload complete: {inserted} added, {updated} updated, {removed} removed.",
+            "inserted": inserted,
+            "updated": updated,
+            "removed": removed,
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -275,22 +320,31 @@ async def upload_photo(student_id: str, file: UploadFile = File(...), request: R
 
     try:
         contents = await file.read()
+
+        # 2. Delete old photo from storage to avoid orphan accumulation
+        try:
+            existing = supabase.table("students").select("photo_url").eq("id", student_id).single().execute()
+            old_url = existing.data.get("photo_url") if existing.data else None
+            if old_url:
+                # Extract just the filename from the public URL
+                old_filename = old_url.split("/")[-1].split("?")[0]
+                supabase.storage.from_("student-photos").remove([old_filename])
+        except Exception:
+            pass  # If old photo cleanup fails, still proceed with upload
         
-        # 2. Generate a unique filename so photos don't overwrite each other
-        file_extension = file.filename.split(".")[-1]
+        # 3. Generate a unique filename
+        file_extension = file.filename.split(".")[-1] if "." in file.filename else "jpg"
         unique_filename = f"{student_id}_{uuid.uuid4().hex}.{file_extension}"
         
-        # 3. Upload the raw image bytes to your Supabase Storage bucket
+        # 4. Upload the new image bytes to Supabase Storage
         supabase.storage.from_("student-photos").upload(
             file=contents,
             path=unique_filename,
             file_options={"content-type": file.content_type}
         )
         
-        # 4. Get the public URL for that newly uploaded image
+        # 5. Get the public URL and update the student row
         public_url = supabase.storage.from_("student-photos").get_public_url(unique_filename)
-        
-        # 5. Update the student's database row with the new photo_url
         supabase.table("students").update({"photo_url": public_url}).eq("id", student_id).execute()
         
         return {
@@ -365,7 +419,18 @@ async def upload_photo_mobile(student_id: str, file: UploadFile = File(...), sch
 
     try:
         contents = await file.read()
-        file_extension = file.filename.split(".")[-1]
+
+        # Delete old photo from storage to avoid orphan accumulation
+        try:
+            old_check = supabase.table("students").select("photo_url").eq("id", student_id).single().execute()
+            old_url = old_check.data.get("photo_url") if old_check.data else None
+            if old_url:
+                old_filename = old_url.split("/")[-1].split("?")[0]
+                supabase.storage.from_("student-photos").remove([old_filename])
+        except Exception:
+            pass  # Cleanup failure shouldn't block the upload
+
+        file_extension = file.filename.split(".")[-1] if "." in file.filename else "jpg"
         unique_filename = f"{student_id}_{uuid.uuid4().hex}.{file_extension}"
         
         supabase.storage.from_("student-photos").upload(
@@ -416,6 +481,23 @@ async def sync_data(payload: dict, school_id: str = Depends(verify_school_user))
                 .execute()
 
         return {"message": "Sync complete"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/mobile/student")
+async def create_student_mobile(data: dict, school_id: str = Depends(verify_school_user)):
+    try:
+        # Assign the school ID from the token
+        data["school_id"] = school_id
+        
+        # Remove None and empty string values so DB defaults kick in
+        clean_data = {k: v for k, v in data.items() if v is not None and v != ""}
+        
+        if "custom_data" not in clean_data:
+            clean_data["custom_data"] = {}
+
+        response = supabase.table("students").insert(clean_data).execute()
+        return {"message": "Student created", "data": response.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
