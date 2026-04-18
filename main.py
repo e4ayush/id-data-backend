@@ -65,27 +65,40 @@ def generate_password(length=10):
 async def create_school(school: SchoolCreate, request: Request):
     verify_admin(request)
     try:
+        clean_name = "".join(e for e in school.name if e.isalnum()).lower()
+        email = f"admin@{clean_name}.com"
+        
+        # 0. Cleanup any orphaned user with this email to avoid collision
+        try:
+            users = supabase.auth.admin.list_users()
+            for u in users:
+                if getattr(u, 'email', '') == email:
+                    supabase.auth.admin.delete_user(u.id)
+        except Exception:
+            pass
+
         # 1. Create the school in the Database
         db_response = supabase.table("schools").insert({"name": school.name}).execute()
         school_data = db_response.data[0]
         school_id = school_data["id"]
 
         # 2. Generate Login Credentials for the Mobile App
-        # Removes spaces to make a clean email (e.g., "DPS Patna" -> "admin@dpspatna.com")
-        clean_name = "".join(e for e in school.name if e.isalnum()).lower()
-        email = f"admin@{clean_name}.com"
         password = generate_password()
 
         # 3. Create the User in Supabase Auth (Using the Admin API)
-        supabase.auth.admin.create_user({
-            "email": email,
-            "password": password,
-            "email_confirm": True, # Auto-confirm so they don't need an email link
-            "user_metadata": {
-                "school_id": school_id, # Tie this login to their specific school
-                "role": "school_admin"
-            }
-        })
+        try:
+            supabase.auth.admin.create_user({
+                "email": email,
+                "password": password,
+                "email_confirm": True, # Auto-confirm so they don't need an email link
+                "user_metadata": {
+                    "school_id": school_id, # Tie this login to their specific school
+                    "role": "school_admin"
+                }
+            })
+        except Exception as e:
+            supabase.table("schools").delete().eq("id", school_id).execute()
+            raise HTTPException(status_code=400, detail=f"User creation failed: {str(e)}")
 
         return {
             "message": "School and credentials created", 
@@ -95,6 +108,8 @@ async def create_school(school: SchoolCreate, request: Request):
                 "password": password
             }
         }
+    except HTTPException as he:
+        raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -148,6 +163,8 @@ async def reset_password(school_id: str, request: Request):
         supabase.auth.admin.update_user_by_id(target_user.id, {"password": new_password})
         
         return {"message": "Password reset successfully", "new_password": new_password, "email": target_user.email}
+    except HTTPException as he:
+        raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -409,7 +426,20 @@ async def delete_school(school_id: str, request: Request):
         # Because we used "ON DELETE CASCADE" in our SQL earlier, 
         # deleting the school will automatically delete all its students too!
         response = supabase.table("schools").delete().eq("id", school_id).execute()
+        
+        # Clean up the associated user in Auth as well
+        try:
+            users = supabase.auth.admin.list_users()
+            for u in users:
+                metadata = getattr(u, 'user_metadata', {})
+                if metadata and metadata.get("school_id") == school_id:
+                    supabase.auth.admin.delete_user(u.id)
+        except Exception:
+            pass
+            
         return {"message": "School deleted successfully."}
+    except HTTPException as he:
+        raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
