@@ -547,9 +547,18 @@ async def upload_bulk_photos(
 @app.get("/mobile/students")
 async def get_students_mobile(school_id: str = Depends(verify_school_user)):
     try:
+        # Get student list
         response = supabase.table("students").select("*").eq("school_id", school_id).order("name").execute()
         students = [format_dob_for_frontend(s) for s in response.data]
-        return {"data": students}
+        
+        # Get school name
+        school_res = supabase.table("schools").select("name").eq("id", school_id).single().execute()
+        school_name = school_res.data.get("name") if school_res.data else "Unknown School"
+
+        return {
+            "data": students,
+            "school_name": school_name
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
