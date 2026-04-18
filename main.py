@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 import os
 from pydantic import BaseModel
@@ -8,6 +8,8 @@ import uuid
 import random
 import string
 from database import supabase
+from PIL import Image
+from typing import List
 
 app = FastAPI()
 
@@ -354,6 +356,145 @@ async def upload_photo(student_id: str, file: UploadFile = File(...), request: R
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------
+# BULK PHOTO UPLOAD  (Admin Dashboard)
+# ---------------------------------------------------------
+
+def compress_image_to_target(image_bytes: bytes, target_kb: int = 100) -> bytes:
+    """Compress an image to be under target_kb using Pillow.
+    Progressively reduces quality and resolution until under budget."""
+    img = Image.open(io.BytesIO(image_bytes))
+
+    # Convert RGBA/P to RGB for JPEG
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+
+    # Cap initial dimensions
+    max_dim = 1024
+    img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+
+    # Try progressively lower quality
+    for quality in range(85, 5, -5):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= target_kb * 1024:
+            return buf.getvalue()
+
+    # Still too large — shrink dimensions further
+    for dim in [800, 600, 400]:
+        img.thumbnail((dim, dim), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=30, optimize=True)
+        if buf.tell() <= target_kb * 1024:
+            return buf.getvalue()
+
+    # Return whatever we have
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=15, optimize=True)
+    return buf.getvalue()
+
+
+@app.post("/upload-photos/{school_id}")
+async def upload_bulk_photos(
+    school_id: str,
+    match_column: str = Form(...),
+    files: List[UploadFile] = File(...),
+    request: Request = None,
+):
+    """Upload a batch of student photos.
+    Each file's name (without extension) is matched against `match_column`
+    of the students belonging to `school_id`.
+    Images are compressed to < 100 KB before uploading to Supabase Storage.
+    """
+    verify_admin(request)
+
+    # Fetch all students for this school
+    resp = supabase.table("students").select("*").eq("school_id", school_id).execute()
+    all_students = resp.data or []
+
+    if not all_students:
+        raise HTTPException(status_code=400, detail="No students found for this school")
+
+    # Build a lookup: column_value -> student record
+    # Supports core columns AND custom_data keys
+    CORE_COLUMNS = ["name", "class", "section", "roll_number", "admission_number",
+                    "dob", "fathers_name", "mothers_name", "blood_group",
+                    "phone", "aadhar_number", "address", "house", "height", "weight"]
+
+    student_lookup = {}
+    for s in all_students:
+        value = None
+        if match_column in CORE_COLUMNS:
+            value = s.get(match_column)
+        else:
+            # Check in custom_data
+            value = (s.get("custom_data") or {}).get(match_column)
+
+        if value:
+            # Normalize: strip whitespace, lowercase for matching
+            student_lookup[str(value).strip().lower()] = s
+
+    matched = 0
+    skipped = 0
+    errors = []
+
+    for f in files:
+        # Extract the filename without extension for matching
+        original_name = f.filename or ""
+        # Handle nested folder paths (browser sends "subfolder/image.jpg")
+        base_name = original_name.rsplit("/", 1)[-1]  # get last part
+        base_name = base_name.rsplit("\\", 1)[-1]  # handle windows paths too
+        name_without_ext = base_name.rsplit(".", 1)[0].strip().lower()
+
+        if not name_without_ext:
+            skipped += 1
+            continue
+
+        # Do we have a matching student?
+        student = student_lookup.get(name_without_ext)
+        if not student:
+            skipped += 1
+            errors.append(f"No match for '{base_name}'")
+            continue
+
+        try:
+            contents = await f.read()
+
+            # Compress to under 100 KB
+            compressed = compress_image_to_target(contents, target_kb=100)
+
+            # Delete old photo if exists
+            old_url = student.get("photo_url")
+            if old_url:
+                try:
+                    old_filename = old_url.split("/")[-1].split("?")[0]
+                    supabase.storage.from_("student-photos").remove([old_filename])
+                except Exception:
+                    pass
+
+            # Upload compressed image
+            unique_filename = f"{student['id']}_{uuid.uuid4().hex}.jpg"
+            supabase.storage.from_("student-photos").upload(
+                file=compressed,
+                path=unique_filename,
+                file_options={"content-type": "image/jpeg"},
+            )
+
+            public_url = supabase.storage.from_("student-photos").get_public_url(unique_filename)
+            supabase.table("students").update({"photo_url": public_url}).eq("id", student["id"]).execute()
+
+            matched += 1
+        except Exception as e:
+            errors.append(f"Error processing '{base_name}': {str(e)}")
+            skipped += 1
+
+    return {
+        "message": f"Bulk upload complete: {matched} matched, {skipped} skipped.",
+        "matched": matched,
+        "skipped": skipped,
+        "errors": errors[:20],  # Cap error list so response isn't huge
+    }
 
 # ---------------------------------------------------------
 # MOBILE APP ROUTES (Protected by Supabase JWT)
