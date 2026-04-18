@@ -109,7 +109,45 @@ async def get_schools(request: Request):
     try:
         # We order by created_at descending so the newest schools are at the top
         response = supabase.table("schools").select("id, name").order("created_at", desc=True).execute()
-        return {"data": response.data}
+        schools_data = response.data
+        
+        try:
+            users = supabase.auth.admin.list_users()
+            email_map = {}
+            for u in users:
+                metadata = getattr(u, 'user_metadata', {})
+                if metadata and metadata.get("school_id"):
+                    email_map[metadata["school_id"]] = getattr(u, 'email', None)
+            
+            for school in schools_data:
+                school['login_email'] = email_map.get(school['id'], 'Not set')
+        except Exception as e:
+            for school in schools_data:
+                school['login_email'] = 'Unknown'
+                
+        return {"data": schools_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/schools/{school_id}/reset-password")
+async def reset_password(school_id: str, request: Request):
+    verify_admin(request)
+    try:
+        users = supabase.auth.admin.list_users()
+        target_user = None
+        for u in users:
+            metadata = getattr(u, 'user_metadata', {})
+            if metadata and metadata.get("school_id") == school_id:
+                target_user = u
+                break
+        
+        if not target_user:
+            raise HTTPException(status_code=404, detail="Auth user not found for this school")
+            
+        new_password = generate_password()
+        supabase.auth.admin.update_user_by_id(target_user.id, {"password": new_password})
+        
+        return {"message": "Password reset successfully", "new_password": new_password, "email": target_user.email}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
