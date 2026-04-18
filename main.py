@@ -11,6 +11,26 @@ from database import supabase
 from PIL import Image
 from typing import List
 
+def format_dob_for_frontend(student):
+    """Converts DB YYYY-MM-DD to DD-MM-YYYY for display/export"""
+    dob = student.get("dob")
+    if dob and str(dob).strip():
+        try:
+            student["dob"] = pd.to_datetime(str(dob)).strftime("%d-%m-%Y")
+        except Exception:
+            pass
+    return student
+
+def format_dob_for_db(student_data):
+    """Converts User DD-MM-YYYY back to YYYY-MM-DD for Postgres"""
+    dob = student_data.get("dob")
+    if dob and str(dob).strip():
+        try:
+            student_data["dob"] = pd.to_datetime(str(dob), dayfirst=True).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return student_data
+
 app = FastAPI()
 
 # 1. CORS Setup: Allow Next.js to talk to FastAPI
@@ -174,7 +194,8 @@ async def get_students(school_id: str, request: Request):
     try:
         # We filter by the active school_id and order alphabetically by name
         response = supabase.table("students").select("*").eq("school_id", school_id).order("name").execute()
-        return {"data": response.data}
+        students = [format_dob_for_frontend(s) for s in response.data]
+        return {"data": students}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -513,7 +534,8 @@ async def upload_bulk_photos(
 async def get_students_mobile(school_id: str = Depends(verify_school_user)):
     try:
         response = supabase.table("students").select("*").eq("school_id", school_id).order("name").execute()
-        return {"data": response.data}
+        students = [format_dob_for_frontend(s) for s in response.data]
+        return {"data": students}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -544,6 +566,7 @@ async def update_student_mobile(student_id: str, update_data: dict, school_id: s
         # Security: Prevent them from accidentally updating the ID or School ID
         update_data.pop("id", None)
         update_data.pop("school_id", None)
+        update_data = format_dob_for_db(update_data)
 
         # Push the changes directly to Supabase
         response = supabase.table("students").update(update_data).eq("id", student_id).execute()
@@ -608,6 +631,7 @@ async def sync_data(payload: dict, school_id: str = Depends(verify_school_user))
             student_id = u.pop("id", None)
             if not student_id: continue
             
+            u = format_dob_for_db(u)
             supabase.table("students") \
                 .update(u) \
                 .eq("id", student_id) \
@@ -618,6 +642,7 @@ async def sync_data(payload: dict, school_id: str = Depends(verify_school_user))
             c["school_id"] = school_id
             # Remove ID if present in creation to let DB generate it
             c.pop("id", None) 
+            c = format_dob_for_db(c)
             supabase.table("students").insert(c).execute()
 
         for d in deletes:
@@ -642,6 +667,7 @@ async def create_student_mobile(data: dict, school_id: str = Depends(verify_scho
         
         # Remove None and empty string values so DB defaults kick in
         clean_data = {k: v for k, v in data.items() if v is not None and v != ""}
+        clean_data = format_dob_for_db(clean_data)
         
         if "custom_data" not in clean_data:
             clean_data["custom_data"] = {}
@@ -703,6 +729,7 @@ async def update_student(student_id: str, update_data: dict, request: Request):
         # Security: Prevent changing core IDs
         update_data.pop("id", None)
         update_data.pop("school_id", None)
+        update_data = format_dob_for_db(update_data)
         
         response = supabase.table("students").update(update_data).eq("id", student_id).execute()
         return {"message": "Student updated successfully", "data": response.data}
@@ -729,6 +756,7 @@ async def create_student(data: dict, request: Request):
         
         # Remove None and empty string values so DB defaults kick in
         clean_data = {k: v for k, v in data.items() if v is not None and v != ""}
+        clean_data = format_dob_for_db(clean_data)
         
         # Make sure custom_data exists
         if "custom_data" not in clean_data:
@@ -744,7 +772,7 @@ async def export_students(school_id: str, request: Request):
     verify_admin(request)
     try:
         response = supabase.table("students").select("*").eq("school_id", school_id).order("class").execute()
-        students = response.data
+        students = [format_dob_for_frontend(s) for s in response.data]
 
         # Flatten custom_data into the main row so Datrix gets clean columns
         flattened = []
