@@ -1,4 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header, Depends, Form
+from fastapi.responses import StreamingResponse
+import zipfile
 from fastapi.middleware.cors import CORSMiddleware
 import os
 from pydantic import BaseModel
@@ -365,7 +367,8 @@ async def upload_photo(student_id: str, file: UploadFile = File(...), request: R
         raise HTTPException(status_code=400, detail="File must be an image")
 
     try:
-        contents = await file.read()
+        raw_contents = await file.read()
+        contents = compress_image_to_target(raw_contents, target_kb=100)
 
         # 2. Delete old photo from storage to avoid orphan accumulation
         try:
@@ -614,7 +617,8 @@ async def upload_photo_mobile(student_id: str, file: UploadFile = File(...), sch
         raise HTTPException(status_code=400, detail="File must be an image")
 
     try:
-        contents = await file.read()
+        raw_contents = await file.read()
+        contents = compress_image_to_target(raw_contents, target_kb=100)
 
         # Delete old photo from storage to avoid orphan accumulation
         try:
@@ -806,13 +810,63 @@ async def export_students(school_id: str, request: Request):
                 "section": s.get("section"),
                 "roll_number": s.get("roll_number"),
                 "admission_number": s.get("admission_number"),
-                "photo_url": s.get("photo_url"),
             }
+            if s.get("photo_url"):
+                adm = str(s.get("admission_number") or s.get("roll_number") or "").strip()
+                if adm:
+                    safe_adm = "".join(c for c in adm if c.isalnum() or c in ('-', '_', ' '))
+                    row["photo"] = f"{safe_adm}.jpg"
+                else:
+                    safe_name = "".join(c for c in str(s.get("name") or "Unknown") if c.isalnum() or c in ('-', '_', ' '))
+                    row["photo"] = f"{safe_name}_{s['id'][-4:]}.jpg"
+            else:
+                row["photo"] = ""
+
             # Merge custom_data fields into the flat row
             if s.get("custom_data"):
                 row.update(s["custom_data"])
             flattened.append(row)
 
         return {"school_id": school_id, "total": len(flattened), "data": flattened}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/download-photos/{school_id}")
+async def download_photos(school_id: str, request: Request):
+    """Download a ZIP file of all photos for a school"""
+    verify_admin(request)
+    try:
+        response = supabase.table("students").select("id, name, admission_number, roll_number, photo_url").eq("school_id", school_id).execute()
+        students = response.data or []
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for s in students:
+                url = s.get("photo_url")
+                if url:
+                    # extract filename in supabase
+                    filename_in_db = url.split("/")[-1].split("?")[0]
+                    try:
+                        photo_bytes = supabase.storage.from_("student-photos").download(filename_in_db)
+                        
+                        # Apply same naming logic as export
+                        adm = str(s.get("admission_number") or s.get("roll_number") or "").strip()
+                        if adm:
+                            safe_adm = "".join(c for c in adm if c.isalnum() or c in ('-', '_', ' '))
+                            zip_filename = f"{safe_adm}.jpg"
+                        else:
+                            safe_name = "".join(c for c in str(s.get("name") or "Unknown") if c.isalnum() or c in ('-', '_', ' '))
+                            zip_filename = f"{safe_name}_{s['id'][-4:]}.jpg"
+
+                        zip_file.writestr(zip_filename, photo_bytes)
+                    except Exception as e:
+                        print(f"Error downloading {filename_in_db}: {e}")
+                        
+        zip_buffer.seek(0)
+        return StreamingResponse(
+            zip_buffer, 
+            media_type="application/zip", 
+            headers={"Content-Disposition": f"attachment; filename=photos_{school_id}.zip"}
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
