@@ -1,6 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header, Depends, Form
 from fastapi.responses import StreamingResponse
 import zipfile
+import asyncio
+import concurrent.futures
 from fastapi.middleware.cors import CORSMiddleware
 import os
 from pydantic import BaseModel
@@ -829,7 +831,8 @@ async def export_students(school_id: str, request: Request):
 
         return {"school_id": school_id, "total": len(flattened), "data": flattened}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Export Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to export student data. Please try again.")
 
 @app.get("/download-photos/{school_id}")
 async def download_photos(school_id: str, request: Request):
@@ -839,28 +842,37 @@ async def download_photos(school_id: str, request: Request):
         response = supabase.table("students").select("id, name, admission_number, roll_number, photo_url").eq("school_id", school_id).execute()
         students = response.data or []
 
+        def download_single_photo(s):
+            url = s.get("photo_url")
+            if not url: return None
+            filename_in_db = url.split("/")[-1].split("?")[0]
+            try:
+                photo_bytes = supabase.storage.from_("student-photos").download(filename_in_db)
+                adm = str(s.get("admission_number") or s.get("roll_number") or "").strip()
+                if adm:
+                    safe_adm = "".join(c for c in adm if c.isalnum() or c in ('-', '_', ' '))
+                    zip_filename = f"{safe_adm}.jpg"
+                else:
+                    safe_name = "".join(c for c in str(s.get("name") or "Unknown") if c.isalnum() or c in ('-', '_', ' '))
+                    zip_filename = f"{safe_name}_{s['id'][-4:]}.jpg"
+                return (zip_filename, photo_bytes)
+            except Exception as e:
+                print(f"Error downloading {filename_in_db}: {e}")
+                return None
+
+        # Execute 10 at a time to scale for large schools without timing out
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            results = await loop.run_in_executor(
+                None,
+                lambda: list(executor.map(download_single_photo, students))
+            )
+
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for s in students:
-                url = s.get("photo_url")
-                if url:
-                    # extract filename in supabase
-                    filename_in_db = url.split("/")[-1].split("?")[0]
-                    try:
-                        photo_bytes = supabase.storage.from_("student-photos").download(filename_in_db)
-                        
-                        # Apply same naming logic as export
-                        adm = str(s.get("admission_number") or s.get("roll_number") or "").strip()
-                        if adm:
-                            safe_adm = "".join(c for c in adm if c.isalnum() or c in ('-', '_', ' '))
-                            zip_filename = f"{safe_adm}.jpg"
-                        else:
-                            safe_name = "".join(c for c in str(s.get("name") or "Unknown") if c.isalnum() or c in ('-', '_', ' '))
-                            zip_filename = f"{safe_name}_{s['id'][-4:]}.jpg"
-
-                        zip_file.writestr(zip_filename, photo_bytes)
-                    except Exception as e:
-                        print(f"Error downloading {filename_in_db}: {e}")
+            for res in results:
+                if res is not None:
+                    zip_file.writestr(res[0], res[1])
                         
         zip_buffer.seek(0)
         return StreamingResponse(
@@ -869,4 +881,5 @@ async def download_photos(school_id: str, request: Request):
             headers={"Content-Disposition": f"attachment; filename=photos_{school_id}.zip"}
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Download Photos Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to securely package your photos. Please try again.")
