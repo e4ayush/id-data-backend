@@ -15,6 +15,82 @@ from database import supabase
 from PIL import Image
 from typing import List
 
+SCHEMA_KEY = "__bizera_column_schema"
+
+FIELD_MAP = {
+    "name": "name",
+    "student name": "name",
+    "full name": "name",
+    "class": "class",
+    "section": "section",
+    "roll number": "roll_number",
+    "roll no": "roll_number",
+    "roll_number": "roll_number",
+    "roll": "roll_number",
+    "admission number": "admission_number",
+    "admission no": "admission_number",
+    "admission_number": "admission_number",
+    "dob": "dob",
+    "date of birth": "dob",
+    "father name": "fathers_name",
+    "fathers name": "fathers_name",
+    "father's name": "fathers_name",
+    "fathers_name": "fathers_name",
+    "mother name": "mothers_name",
+    "mothers name": "mothers_name",
+    "mother's name": "mothers_name",
+    "mothers_name": "mothers_name",
+    "blood group": "blood_group",
+    "blood_group": "blood_group",
+    "height": "height",
+    "weight": "weight",
+    "house": "house",
+    "address": "address",
+    "phone": "phone",
+    "phone number": "phone",
+    "aadhar": "aadhar_number",
+    "aadhar number": "aadhar_number",
+    "aadhar_number": "aadhar_number",
+    "photo": "photo",
+}
+
+CORE_EXPORT_FIELDS = [
+    "name",
+    "class",
+    "section",
+    "roll_number",
+    "admission_number",
+    "dob",
+    "fathers_name",
+    "mothers_name",
+    "blood_group",
+    "phone",
+    "aadhar_number",
+    "address",
+    "house",
+    "height",
+    "weight",
+]
+
+DISPLAY_LABELS = {
+    "name": "Name",
+    "class": "Class",
+    "section": "Section",
+    "roll_number": "Roll Number",
+    "admission_number": "Admission Number",
+    "dob": "Date of Birth",
+    "fathers_name": "Father's Name",
+    "mothers_name": "Mother's Name",
+    "blood_group": "Blood Group",
+    "phone": "Phone",
+    "aadhar_number": "Aadhar Number",
+    "address": "Address",
+    "house": "House",
+    "height": "Height",
+    "weight": "Weight",
+    "photo": "Photo",
+}
+
 def format_dob_for_frontend(student):
     """Converts DB YYYY-MM-DD to DD-MM-YYYY for display/export"""
     dob = student.get("dob")
@@ -34,6 +110,106 @@ def format_dob_for_db(student_data):
         except Exception:
             pass
     return student_data
+
+def normalize_header(header):
+    return str(header).strip()
+
+def normalize_header_key(header):
+    return normalize_header(header).lower().strip()
+
+def build_column_schema(headers):
+    schema = []
+    seen_headers = set()
+    for header in headers:
+        clean_header = normalize_header(header)
+        if not clean_header or clean_header in seen_headers:
+            continue
+
+        normalized = normalize_header_key(clean_header)
+        field_key = FIELD_MAP.get(normalized, clean_header)
+        schema.append({
+            "header": clean_header,
+            "key": field_key,
+            "is_custom": field_key not in CORE_EXPORT_FIELDS and field_key != "photo",
+            "is_photo": field_key == "photo",
+        })
+        seen_headers.add(clean_header)
+    return schema
+
+def get_schema_from_students(students):
+    for student in students:
+        custom_data = student.get("custom_data") or {}
+        schema = custom_data.get(SCHEMA_KEY)
+        if isinstance(schema, list) and schema:
+            return schema
+
+    inferred = []
+    seen = set()
+    for field in CORE_EXPORT_FIELDS:
+        if any(student.get(field) not in (None, "") for student in students):
+            inferred.append({
+                "header": DISPLAY_LABELS.get(field, field),
+                "key": field,
+                "is_custom": False,
+                "is_photo": False,
+            })
+            seen.add(field)
+
+    custom_keys = []
+    for student in students:
+        for key in (student.get("custom_data") or {}).keys():
+            if key != SCHEMA_KEY and key not in seen and key not in custom_keys:
+                custom_keys.append(key)
+
+    for key in custom_keys:
+        inferred.append({
+            "header": key,
+            "key": key,
+            "is_custom": True,
+            "is_photo": False,
+        })
+
+    return inferred
+
+def strip_internal_custom_data(student):
+    custom_data = student.get("custom_data")
+    if isinstance(custom_data, dict) and SCHEMA_KEY in custom_data:
+        student["custom_data"] = {k: v for k, v in custom_data.items() if k != SCHEMA_KEY}
+    return student
+
+def photo_export_name(student):
+    if not student.get("photo_url"):
+        return ""
+    adm = str(student.get("admission_number") or student.get("roll_number") or "").strip()
+    if adm:
+        safe_adm = "".join(c for c in adm if c.isalnum() or c in ('-', '_', ' '))
+        return f"{safe_adm}.jpg"
+
+    safe_name = "".join(c for c in str(student.get("name") or "Unknown") if c.isalnum() or c in ('-', '_', ' '))
+    return f"{safe_name}_{student['id'][-4:]}.jpg"
+
+def schema_value(student, field):
+    if field.get("is_photo") or field.get("key") == "photo":
+        return photo_export_name(student)
+
+    key = field.get("key")
+    if field.get("is_custom"):
+        return (student.get("custom_data") or {}).get(key, "")
+    return student.get(key, "")
+
+def preserve_schema_in_custom_data(update_data, existing_custom_data):
+    if "custom_data" not in update_data:
+        return update_data
+
+    custom_data = update_data.get("custom_data") or {}
+    if not isinstance(custom_data, dict):
+        custom_data = {}
+
+    if isinstance(existing_custom_data, dict) and SCHEMA_KEY in existing_custom_data and SCHEMA_KEY not in custom_data:
+        custom_data[SCHEMA_KEY] = existing_custom_data[SCHEMA_KEY]
+
+    update_data["custom_data"] = custom_data
+    return update_data
 
 app = FastAPI()
 
@@ -78,6 +254,9 @@ def verify_school_user(authorization: str = Header(...)):
 
 class SchoolCreate(BaseModel):
     name: str
+
+class BulkDeleteRequest(BaseModel):
+    ids: List[str]
 
 def generate_password(length=10):
     """Generates a random 10-character password"""
@@ -199,7 +378,9 @@ async def get_students(school_id: str, request: Request):
         # We filter by the active school_id and order alphabetically by name
         response = supabase.table("students").select("*").eq("school_id", school_id).order("name").execute()
         students = [format_dob_for_frontend(s) for s in response.data]
-        return {"data": students}
+        column_schema = get_schema_from_students(students)
+        students = [strip_internal_custom_data(s) for s in students]
+        return {"data": students, "column_schema": column_schema}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -222,33 +403,7 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
         df = df.where(pd.notnull(df), None)
         records = df.to_dict(orient="records")
         
-        # Extended core field mapping — covers your actual schema
-        field_map = {
-            "name": "name",
-            "class": "class",
-            "section": "section",
-            "roll number": "roll_number",
-            "roll": "roll_number",
-            "admission number": "admission_number",
-            "admission no": "admission_number",
-            "dob": "dob",
-            "date of birth": "dob",
-            "father name": "fathers_name",
-            "fathers name": "fathers_name",
-            "father's name": "fathers_name",
-            "mother name": "mothers_name",
-            "mothers name": "mothers_name",
-            "mother's name": "mothers_name",
-            "blood group": "blood_group",
-            "height": "height",
-            "weight": "weight",
-            "house": "house",
-            "address": "address",
-            "phone": "phone",
-            "phone number": "phone",
-            "aadhar": "aadhar_number",
-            "aadhar number": "aadhar_number",
-        }
+        column_schema = build_column_schema(df.columns)
 
         student_data = []
         for row in records:
@@ -256,7 +411,9 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
             
             student = {
                 "school_id": school_id,
-                "custom_data": {}
+                "custom_data": {
+                    SCHEMA_KEY: column_schema
+                }
             }
 
             for normalized, original_key in row_keys_lower.items():
@@ -264,12 +421,14 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 if value is None or str(value).strip() == "" or str(value) == "nan":
                     continue
                 
-                if normalized in field_map:
+                if normalized in FIELD_MAP:
                     # Maps to a real DB column
-                    col_name = field_map[normalized]
+                    col_name = FIELD_MAP[normalized]
                     val_str = str(value).strip()
                     
-                    if col_name == "dob" and val_str:
+                    if col_name == "photo":
+                        continue
+                    elif col_name == "dob" and val_str:
                         try:
                             # Pass dayfirst=True to handle DD-MM-YYYY natively
                             parsed_date = pd.to_datetime(val_str, dayfirst=True).strftime("%Y-%m-%d")
@@ -555,6 +714,8 @@ async def get_students_mobile(school_id: str = Depends(verify_school_user)):
         # Get student list
         response = supabase.table("students").select("*").eq("school_id", school_id).order("name").execute()
         students = [format_dob_for_frontend(s) for s in response.data]
+        column_schema = get_schema_from_students(students)
+        students = [strip_internal_custom_data(s) for s in students]
         
         # Get school name
         school_res = supabase.table("schools").select("name").eq("id", school_id).single().execute()
@@ -562,7 +723,8 @@ async def get_students_mobile(school_id: str = Depends(verify_school_user)):
 
         return {
             "data": students,
-            "school_name": school_name
+            "school_name": school_name,
+            "column_schema": column_schema,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -583,6 +745,27 @@ async def delete_student_mobile(student_id: str, school_id: str = Depends(verify
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/mobile/students/bulk-delete")
+async def bulk_delete_students_mobile(payload: BulkDeleteRequest, school_id: str = Depends(verify_school_user)):
+    student_ids = list(dict.fromkeys([sid for sid in payload.ids if sid]))
+    if not student_ids:
+        raise HTTPException(status_code=400, detail="No student IDs provided")
+
+    try:
+        deleted = 0
+        for student_id in student_ids:
+            response = supabase.table("students").delete().eq("id", student_id).eq("school_id", school_id).execute()
+            if response.data:
+                deleted += len(response.data)
+
+        return {
+            "message": f"{deleted} students deleted successfully",
+            "deleted": deleted,
+            "requested": len(student_ids),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.put("/mobile/update-student/{student_id}")
 async def update_student_mobile(student_id: str, update_data: dict, school_id: str = Depends(verify_school_user)):
     try:
@@ -595,6 +778,8 @@ async def update_student_mobile(student_id: str, update_data: dict, school_id: s
         update_data.pop("id", None)
         update_data.pop("school_id", None)
         update_data = format_dob_for_db(update_data)
+        existing = supabase.table("students").select("custom_data").eq("id", student_id).single().execute()
+        update_data = preserve_schema_in_custom_data(update_data, (existing.data or {}).get("custom_data"))
 
         # Push the changes directly to Supabase
         response = supabase.table("students").update(update_data).eq("id", student_id).execute()
@@ -661,17 +846,26 @@ async def sync_data(payload: dict, school_id: str = Depends(verify_school_user))
             if not student_id: continue
             
             u = format_dob_for_db(u)
+            existing = supabase.table("students").select("custom_data").eq("id", student_id).single().execute()
+            u = preserve_schema_in_custom_data(u, (existing.data or {}).get("custom_data"))
             supabase.table("students") \
                 .update(u) \
                 .eq("id", student_id) \
                 .eq("school_id", school_id) \
                 .execute()
 
+        schema_source = supabase.table("students").select("custom_data").eq("school_id", school_id).limit(1).execute()
+        schema_rows = schema_source.data or []
+        existing_schema_custom_data = (schema_rows[0] or {}).get("custom_data") if schema_rows else None
+
         for c in creates:
             c["school_id"] = school_id
             # Remove ID if present in creation to let DB generate it
             c.pop("id", None) 
             c = format_dob_for_db(c)
+            if "custom_data" not in c:
+                c["custom_data"] = {}
+            c = preserve_schema_in_custom_data(c, existing_schema_custom_data)
             supabase.table("students").insert(c).execute()
 
         for d in deletes:
@@ -700,6 +894,10 @@ async def create_student_mobile(data: dict, school_id: str = Depends(verify_scho
         
         if "custom_data" not in clean_data:
             clean_data["custom_data"] = {}
+        schema_source = supabase.table("students").select("custom_data").eq("school_id", school_id).limit(1).execute()
+        schema_rows = schema_source.data or []
+        if schema_rows:
+            clean_data = preserve_schema_in_custom_data(clean_data, (schema_rows[0] or {}).get("custom_data"))
 
         response = supabase.table("students").insert(clean_data).execute()
         return {"message": "Student created", "data": response.data}
@@ -759,6 +957,8 @@ async def update_student(student_id: str, update_data: dict, request: Request):
         update_data.pop("id", None)
         update_data.pop("school_id", None)
         update_data = format_dob_for_db(update_data)
+        existing = supabase.table("students").select("custom_data").eq("id", student_id).single().execute()
+        update_data = preserve_schema_in_custom_data(update_data, (existing.data or {}).get("custom_data"))
         
         response = supabase.table("students").update(update_data).eq("id", student_id).execute()
         return {"message": "Student updated successfully", "data": response.data}
@@ -772,6 +972,28 @@ async def delete_student(student_id: str, request: Request):
     try:
         response = supabase.table("students").delete().eq("id", student_id).execute()
         return {"message": "Student deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/students/bulk-delete")
+async def bulk_delete_students(payload: BulkDeleteRequest, request: Request):
+    verify_admin(request)
+    student_ids = list(dict.fromkeys([sid for sid in payload.ids if sid]))
+    if not student_ids:
+        raise HTTPException(status_code=400, detail="No student IDs provided")
+
+    try:
+        deleted = 0
+        for student_id in student_ids:
+            response = supabase.table("students").delete().eq("id", student_id).execute()
+            if response.data:
+                deleted += len(response.data)
+
+        return {
+            "message": f"{deleted} students deleted successfully",
+            "deleted": deleted,
+            "requested": len(student_ids),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -790,6 +1012,10 @@ async def create_student(data: dict, request: Request):
         # Make sure custom_data exists
         if "custom_data" not in clean_data:
             clean_data["custom_data"] = {}
+        schema_source = supabase.table("students").select("custom_data").eq("school_id", clean_data["school_id"]).limit(1).execute()
+        schema_rows = schema_source.data or []
+        if schema_rows:
+            clean_data = preserve_schema_in_custom_data(clean_data, (schema_rows[0] or {}).get("custom_data"))
 
         response = supabase.table("students").insert(clean_data).execute()
         return {"message": "Student created", "data": response.data}
@@ -802,45 +1028,47 @@ async def export_students(school_id: str, request: Request):
     try:
         response = supabase.table("students").select("*").eq("school_id", school_id).order("class").execute()
         students = [format_dob_for_frontend(s) for s in response.data]
+        column_schema = get_schema_from_students(students)
 
-        # Flatten custom_data into the main row so Datrix gets clean columns
+        # Flatten only the columns that belong to this school's uploaded sheet.
         flattened = []
         for s in students:
-            row = {
-                "name": s.get("name"),
-                "class": s.get("class"),
-                "section": s.get("section"),
-                "roll_number": s.get("roll_number"),
-                "admission_number": s.get("admission_number"),
-            }
-            if s.get("photo_url"):
-                adm = str(s.get("admission_number") or s.get("roll_number") or "").strip()
-                if adm:
-                    safe_adm = "".join(c for c in adm if c.isalnum() or c in ('-', '_', ' '))
-                    row["photo"] = f"{safe_adm}.jpg"
-                else:
-                    safe_name = "".join(c for c in str(s.get("name") or "Unknown") if c.isalnum() or c in ('-', '_', ' '))
-                    row["photo"] = f"{safe_name}_{s['id'][-4:]}.jpg"
-            else:
-                row["photo"] = ""
-
-            # Merge custom_data fields into the flat row
-            if s.get("custom_data"):
-                row.update(s["custom_data"])
+            row = {}
+            for field in column_schema:
+                header = field.get("header") or DISPLAY_LABELS.get(field.get("key"), field.get("key"))
+                if not header:
+                    continue
+                row[header] = schema_value(s, field)
             flattened.append(row)
 
-        return {"school_id": school_id, "total": len(flattened), "data": flattened}
+        return {"school_id": school_id, "total": len(flattened), "data": flattened, "column_schema": column_schema}
     except Exception as e:
         print(f"Export Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to export student data. Please try again.")
 
 @app.get("/download-photos/{school_id}")
-async def download_photos(school_id: str, request: Request):
+async def download_photos(school_id: str, request: Request, filename_column: str = None):
     """Download a ZIP file of all photos for a school"""
     verify_admin(request)
     try:
-        response = supabase.table("students").select("id, name, admission_number, roll_number, photo_url").eq("school_id", school_id).execute()
+        response = supabase.table("students").select("*").eq("school_id", school_id).execute()
         students = response.data or []
+
+        def zip_photo_name(s):
+            if filename_column:
+                if filename_column in CORE_EXPORT_FIELDS:
+                    requested_value = s.get(filename_column)
+                elif filename_column == "photo":
+                    requested_value = photo_export_name(s).rsplit(".", 1)[0]
+                else:
+                    requested_value = (s.get("custom_data") or {}).get(filename_column)
+
+                if requested_value:
+                    safe_value = "".join(c for c in str(requested_value).strip() if c.isalnum() or c in ('-', '_', ' '))
+                    if safe_value:
+                        return f"{safe_value}.jpg"
+
+            return photo_export_name(s)
 
         def download_single_photo(s):
             url = s.get("photo_url")
@@ -848,14 +1076,7 @@ async def download_photos(school_id: str, request: Request):
             filename_in_db = url.split("/")[-1].split("?")[0]
             try:
                 photo_bytes = supabase.storage.from_("student-photos").download(filename_in_db)
-                adm = str(s.get("admission_number") or s.get("roll_number") or "").strip()
-                if adm:
-                    safe_adm = "".join(c for c in adm if c.isalnum() or c in ('-', '_', ' '))
-                    zip_filename = f"{safe_adm}.jpg"
-                else:
-                    safe_name = "".join(c for c in str(s.get("name") or "Unknown") if c.isalnum() or c in ('-', '_', ' '))
-                    zip_filename = f"{safe_name}_{s['id'][-4:]}.jpg"
-                return (zip_filename, photo_bytes)
+                return (zip_photo_name(s), photo_bytes)
             except Exception as e:
                 print(f"Error downloading {filename_in_db}: {e}")
                 return None
