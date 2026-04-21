@@ -91,6 +91,12 @@ DISPLAY_LABELS = {
     "photo": "Photo",
 }
 
+def display_header_for_key(key):
+    return DISPLAY_LABELS.get(
+        key,
+        str(key).replace("_", " ").title()
+    )
+
 def format_dob_for_frontend(student):
     """Converts DB YYYY-MM-DD to DD-MM-YYYY for display/export"""
     dob = student.get("dob")
@@ -128,7 +134,7 @@ def build_column_schema(headers):
         normalized = normalize_header_key(clean_header)
         field_key = FIELD_MAP.get(normalized, clean_header)
         schema.append({
-            "header": clean_header,
+            "header": DISPLAY_LABELS.get(field_key, clean_header),
             "key": field_key,
             "is_custom": field_key not in CORE_EXPORT_FIELDS and field_key != "photo",
             "is_photo": field_key == "photo",
@@ -210,6 +216,33 @@ def preserve_schema_in_custom_data(update_data, existing_custom_data):
 
     update_data["custom_data"] = custom_data
     return update_data
+
+def ensure_unique_admission_number(data, school_id, current_student_id=None):
+    admission_number = str(data.get("admission_number") or "").strip()
+    if not admission_number:
+        return
+
+    query = supabase.table("students").select("id, name").eq("school_id", school_id).eq("admission_number", admission_number)
+    response = query.execute()
+    matches = response.data or []
+    if current_student_id:
+        matches = [student for student in matches if student.get("id") != current_student_id]
+
+    if matches:
+        existing_name = matches[0].get("name") or "another student"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Admission number {admission_number} is already used by {existing_name}. Use a unique admission number or leave it blank.",
+        )
+
+def friendly_db_error(error):
+    message = str(error)
+    lower_message = message.lower()
+    if "duplicate" in lower_message and "admission" in lower_message:
+        return "This admission number is already used. Use a unique admission number or leave it blank."
+    if "date/time field value out of range" in lower_message or ("invalid input syntax" in lower_message and "date" in lower_message):
+        return "Date of birth is not in a valid format. Use DD-MM-YYYY, for example 05-12-1974."
+    return message
 
 app = FastAPI()
 
@@ -778,6 +811,7 @@ async def update_student_mobile(student_id: str, update_data: dict, school_id: s
         update_data.pop("id", None)
         update_data.pop("school_id", None)
         update_data = format_dob_for_db(update_data)
+        ensure_unique_admission_number(update_data, school_id, current_student_id=student_id)
         existing = supabase.table("students").select("custom_data").eq("id", student_id).single().execute()
         update_data = preserve_schema_in_custom_data(update_data, (existing.data or {}).get("custom_data"))
 
@@ -865,6 +899,7 @@ async def sync_data(payload: dict, school_id: str = Depends(verify_school_user))
             c = format_dob_for_db(c)
             if "custom_data" not in c:
                 c["custom_data"] = {}
+            ensure_unique_admission_number(c, school_id)
             c = preserve_schema_in_custom_data(c, existing_schema_custom_data)
             supabase.table("students").insert(c).execute()
 
@@ -894,6 +929,7 @@ async def create_student_mobile(data: dict, school_id: str = Depends(verify_scho
         
         if "custom_data" not in clean_data:
             clean_data["custom_data"] = {}
+        ensure_unique_admission_number(clean_data, school_id)
         schema_source = supabase.table("students").select("custom_data").eq("school_id", school_id).limit(1).execute()
         schema_rows = schema_source.data or []
         if schema_rows:
@@ -901,8 +937,10 @@ async def create_student_mobile(data: dict, school_id: str = Depends(verify_scho
 
         response = supabase.table("students").insert(clean_data).execute()
         return {"message": "Student created", "data": response.data}
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=friendly_db_error(e))
 
 # ---------------------------------------------------------
 # SUPER ADMIN ROUTES
@@ -957,6 +995,9 @@ async def update_student(student_id: str, update_data: dict, request: Request):
         update_data.pop("id", None)
         update_data.pop("school_id", None)
         update_data = format_dob_for_db(update_data)
+        existing_school = supabase.table("students").select("school_id").eq("id", student_id).single().execute()
+        if existing_school.data and existing_school.data.get("school_id"):
+            ensure_unique_admission_number(update_data, existing_school.data["school_id"], current_student_id=student_id)
         existing = supabase.table("students").select("custom_data").eq("id", student_id).single().execute()
         update_data = preserve_schema_in_custom_data(update_data, (existing.data or {}).get("custom_data"))
         
@@ -1012,6 +1053,7 @@ async def create_student(data: dict, request: Request):
         # Make sure custom_data exists
         if "custom_data" not in clean_data:
             clean_data["custom_data"] = {}
+        ensure_unique_admission_number(clean_data, clean_data["school_id"])
         schema_source = supabase.table("students").select("custom_data").eq("school_id", clean_data["school_id"]).limit(1).execute()
         schema_rows = schema_source.data or []
         if schema_rows:
@@ -1019,8 +1061,10 @@ async def create_student(data: dict, request: Request):
 
         response = supabase.table("students").insert(clean_data).execute()
         return {"message": "Student created", "data": response.data}
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=friendly_db_error(e))
 
 @app.get("/export/{school_id}")
 async def export_students(school_id: str, request: Request):
