@@ -18,20 +18,40 @@ from typing import List
 SCHEMA_KEY = "__bizera_column_schema"
 
 FIELD_MAP = {
+    # ── Name ──
     "name": "name",
     "student name": "name",
+    "student's name": "name",
+    "students name": "name",
     "full name": "name",
+    "pupil name": "name",
+    # ── Class / Section ──
     "class": "class",
+    "grade": "class",
+    "std": "class",
     "section": "section",
+    "sec": "section",
+    # ── Roll Number ──
     "roll number": "roll_number",
     "roll no": "roll_number",
+    "roll no.": "roll_number",
     "roll_number": "roll_number",
     "roll": "roll_number",
+    # ── Admission Number ──
     "admission number": "admission_number",
     "admission no": "admission_number",
+    "admission no.": "admission_number",
     "admission_number": "admission_number",
+    "adm no": "admission_number",
+    "adm no.": "admission_number",
+    "adm number": "admission_number",
+    # ── Date of Birth ──
     "dob": "dob",
     "date of birth": "dob",
+    "birth date": "dob",
+    "d.o.b": "dob",
+    "d.o.b.": "dob",
+    # ── Parents ──
     "father name": "fathers_name",
     "fathers name": "fathers_name",
     "father's name": "fathers_name",
@@ -40,18 +60,41 @@ FIELD_MAP = {
     "mothers name": "mothers_name",
     "mother's name": "mothers_name",
     "mothers_name": "mothers_name",
+    # ── Health ──
     "blood group": "blood_group",
     "blood_group": "blood_group",
     "height": "height",
     "weight": "weight",
+    # ── Misc ──
     "house": "house",
     "address": "address",
+    # ── Phone ──
     "phone": "phone",
     "phone number": "phone",
+    "phone no": "phone",
+    "phone no.": "phone",
+    "mobile": "phone",
+    "mobile no": "phone",
+    "mobile no.": "phone",
+    "mobile number": "phone",
+    "contact": "phone",
+    "contact no": "phone",
+    "contact no.": "phone",
+    "contact number": "phone",
+    # ── Aadhar ──
     "aadhar": "aadhar_number",
     "aadhar number": "aadhar_number",
     "aadhar_number": "aadhar_number",
+    "aadhar no": "aadhar_number",
+    "aadhar no.": "aadhar_number",
+    "aadhaar": "aadhar_number",
+    "aadhaar number": "aadhar_number",
+    "aadhaar no": "aadhar_number",
+    "aadhaar no.": "aadhar_number",
+    # ── Photo ──
     "photo": "photo",
+    "photo no": "photo",
+    "photo no.": "photo",
 }
 
 CORE_EXPORT_FIELDS = [
@@ -123,13 +166,28 @@ def normalize_header(header):
 def normalize_header_key(header):
     return normalize_header(header).lower().strip()
 
-def build_column_schema(headers):
+def build_column_schema(headers, df=None):
+    """Build schema from headers. If a DataFrame is provided, skip columns
+    that are entirely empty so they never appear in the dashboard."""
     schema = []
     seen_headers = set()
     for header in headers:
         clean_header = normalize_header(header)
         if not clean_header or clean_header in seen_headers:
             continue
+
+        # Skip columns that start with "Unnamed" (phantom Excel columns)
+        if clean_header.lower().startswith("unnamed"):
+            continue
+
+        # If a DataFrame is provided, skip columns where every value is empty
+        if df is not None:
+            col_values = df[header]
+            if col_values.isna().all():
+                continue
+            non_null = col_values.dropna().astype(str).str.strip()
+            if (non_null == "").all() or len(non_null) == 0:
+                continue
 
         normalized = normalize_header_key(clean_header)
         field_key = FIELD_MAP.get(normalized, clean_header)
@@ -432,11 +490,15 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
         else:
             df = pd.read_excel(io.BytesIO(contents))
         
+        # Drop columns that are entirely empty (e.g. trailing Excel columns)
+        df = df.dropna(axis=1, how="all")
+        # Also drop columns whose header starts with "Unnamed"
+        df = df[[c for c in df.columns if not str(c).lower().startswith("unnamed")]]
         # Clean the dataframe (replace NaN with None)
         df = df.where(pd.notnull(df), None)
         records = df.to_dict(orient="records")
         
-        column_schema = build_column_schema(df.columns)
+        column_schema = build_column_schema(df.columns, df)
 
         student_data = []
         for row in records:
