@@ -529,8 +529,8 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                             parsed_date = pd.to_datetime(val_str, dayfirst=True).strftime("%Y-%m-%d")
                             student[col_name] = parsed_date
                         except Exception:
-                            # If for whatever reason it fails to parse, pass raw string
-                            student[col_name] = val_str
+                            # If for whatever reason it fails to parse, omit it to avoid DB errors
+                            pass
                     else:
                         student[col_name] = val_str
                 else:
