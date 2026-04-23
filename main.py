@@ -683,6 +683,8 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
             "removed": removed,
         }
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
