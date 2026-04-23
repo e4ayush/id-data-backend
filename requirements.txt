@@ -8,4 +8,5 @@ python-multipart
 httpx
 pandas
 openpyxl
+xlrd
 Pillow
