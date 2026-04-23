@@ -516,6 +516,9 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 if value is None or str(value).strip() == "" or str(value) == "nan":
                     continue
                 
+                if isinstance(value, float) and value.is_integer():
+                    value = int(value)
+                
                 if normalized in FIELD_MAP:
                     # Maps to a real DB column
                     col_name = FIELD_MAP[normalized]
@@ -529,8 +532,7 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                             parsed_date = pd.to_datetime(val_str, dayfirst=True).strftime("%Y-%m-%d")
                             student[col_name] = parsed_date
                         except Exception:
-                            # If for whatever reason it fails to parse, omit it to avoid DB errors
-                            pass
+                            student["_invalid_dob"] = val_str
                     else:
                         student[col_name] = val_str
                 else:
@@ -546,6 +548,78 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 student["class"] = ""
 
             student_data.append(student)
+
+        # Check for duplicates and data validity in the Excel sheet before processing
+        seen_admissions = {}
+        seen_rolls = {} # (class, section) -> {roll: name}
+        validation_errors = []
+        valid_blood_groups = {"A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"}
+
+        for idx, student in enumerate(student_data):
+            name = student.get("name", "Unknown")
+            identifier = name if name != "Unknown" else f"Row {idx+2}"
+
+            # 1. Missing Name
+            if name == "Unknown":
+                validation_errors.append(f"Row {idx+2} is missing a student name")
+
+            # 2. Duplicate Admission Number
+            adm = student.get("admission_number")
+            if adm:
+                if adm in seen_admissions:
+                    validation_errors.append(f"Duplicate Admission No. '{adm}': {identifier} & {seen_admissions[adm]}")
+                else:
+                    seen_admissions[adm] = identifier
+
+            # 3. Duplicate Roll Number in same Class & Section
+            roll = student.get("roll_number")
+            cls = student.get("class", "").strip()
+            sec = student.get("section", "").strip()
+            if roll and cls:
+                key = (cls, sec)
+                if key not in seen_rolls:
+                    seen_rolls[key] = {}
+                if roll in seen_rolls[key]:
+                    validation_errors.append(f"Duplicate Roll No. '{roll}' in Class {cls} Sec {sec}: {identifier} & {seen_rolls[key][roll]}")
+                else:
+                    seen_rolls[key][roll] = identifier
+
+            # 4. Invalid Phone Number
+            phone = student.get("phone")
+            if phone:
+                digits = "".join(filter(str.isdigit, str(phone)))
+                if len(digits) == 12 and digits.startswith("91"):
+                    digits = digits[2:]
+                elif len(digits) == 11 and digits.startswith("0"):
+                    digits = digits[1:]
+                
+                if len(digits) != 10:
+                    validation_errors.append(f"Invalid Phone '{phone}' for {identifier}. Must be 10 digits.")
+                else:
+                    student["phone"] = digits
+
+            # 5. Invalid Blood Group
+            bg = student.get("blood_group")
+            if bg:
+                clean_bg = str(bg).strip().upper().replace(" ", "")
+                if clean_bg not in valid_blood_groups:
+                    validation_errors.append(f"Invalid Blood Group '{bg}' for {identifier}.")
+                else:
+                    student["blood_group"] = clean_bg
+
+            # 6. Invalid DOB
+            if "_invalid_dob" in student:
+                validation_errors.append(f"Invalid Date of Birth '{student['_invalid_dob']}' for {identifier}. Use DD-MM-YYYY.")
+                del student["_invalid_dob"]
+
+        if validation_errors:
+            error_msg = "Validation failed: " + " | ".join(validation_errors[:5])
+            if len(validation_errors) > 5:
+                error_msg += f" ...and {len(validation_errors) - 5} more issues."
+            raise HTTPException(
+                status_code=400,
+                detail=error_msg
+            )
 
         # ── Safe Upsert Strategy ──────────────────────────────────────────
         # Split students into those with an admission_number (can be matched)
