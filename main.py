@@ -141,21 +141,40 @@ def display_header_for_key(key):
     )
 
 def format_dob_for_frontend(student):
-    """Converts DB YYYY-MM-DD to DD-MM-YYYY for display/export"""
+    """Converts DB YYYY-MM-DD to DD--MM--YYYY for display/export to prevent Excel auto-format"""
+    import re
+    # 1. Format core dob field
     dob = student.get("dob")
     if dob and str(dob).strip():
         try:
-            student["dob"] = pd.to_datetime(str(dob)).strftime("%d-%m-%Y")
+            # Standardize separators to single dash first, then format to double dash
+            clean_val = re.sub(r'[\.\/\\\-]+', '-', str(dob))
+            student["dob"] = pd.to_datetime(clean_val).strftime("%d--%m--%Y")
         except Exception:
             pass
+            
+    # 2. Aggressively format any other fields that look like dates in custom_data
+    custom_data = student.get("custom_data")
+    if isinstance(custom_data, dict):
+        for k, v in custom_data.items():
+            # Check if key implies a date or if value looks like a date string
+            if "date" in k.lower() or "dob" in k.lower():
+                if v and str(v).strip() and len(str(v)) >= 8:
+                    try:
+                        clean_v = re.sub(r'[\.\/\\\-]+', '-', str(v))
+                        student["custom_data"][k] = pd.to_datetime(clean_v, dayfirst=True).strftime("%d--%m--%Y")
+                    except Exception:
+                        pass
     return student
 
 def format_dob_for_db(student_data):
-    """Converts User DD-MM-YYYY back to YYYY-MM-DD for Postgres"""
+    """Converts User DD-MM-YYYY (or any format) back to YYYY-MM-DD for Postgres"""
+    import re
     dob = student_data.get("dob")
     if dob and str(dob).strip():
         try:
-            student_data["dob"] = pd.to_datetime(str(dob), dayfirst=True).strftime("%Y-%m-%d")
+            clean_val = re.sub(r'[\.\/\\\-]+', '-', str(dob))
+            student_data["dob"] = pd.to_datetime(clean_val, dayfirst=True).strftime("%Y-%m-%d")
         except Exception:
             pass
     return student_data
