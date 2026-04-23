@@ -254,7 +254,9 @@ def photo_export_name(student):
 
 def schema_value(student, field):
     if field.get("is_photo") or field.get("key") == "photo":
-        return photo_export_name(student)
+        if student.get("photo_url"):
+            return photo_export_name(student)
+        return (student.get("custom_data") or {}).get("_original_photo_filename", "")
 
     key = field.get("key")
     if field.get("is_custom"):
@@ -525,11 +527,14 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                     val_str = str(value).strip()
                     
                     if col_name == "photo":
+                        student["custom_data"]["_original_photo_filename"] = val_str
                         continue
                     elif col_name == "dob" and val_str:
+                        import re
                         try:
-                            # Pass dayfirst=True to handle DD-MM-YYYY natively
-                            parsed_date = pd.to_datetime(val_str, dayfirst=True).strftime("%Y-%m-%d")
+                            # Clean up common date typos: multiple dots, slashes, etc.
+                            clean_val = re.sub(r'[\.\/\\\-]+', '-', val_str)
+                            parsed_date = pd.to_datetime(clean_val, dayfirst=True).strftime("%Y-%m-%d")
                             student[col_name] = parsed_date
                         except Exception:
                             student["_invalid_dob"] = val_str
