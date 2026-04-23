@@ -613,12 +613,9 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 del student["_invalid_dob"]
 
         if validation_errors:
-            error_msg = "Validation failed: " + " | ".join(validation_errors[:5])
-            if len(validation_errors) > 5:
-                error_msg += f" ...and {len(validation_errors) - 5} more issues."
             raise HTTPException(
                 status_code=400,
-                detail=error_msg
+                detail={"message": "Validation failed", "errors": validation_errors}
             )
 
         # ── Safe Upsert Strategy ──────────────────────────────────────────
