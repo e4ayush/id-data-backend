@@ -546,6 +546,7 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                     val_str = str(value).strip()
                     
                     if col_name == "photo":
+                        # Save the photo column value from CSV so it can be matched later
                         student["custom_data"]["_original_photo_filename"] = val_str
                         continue
                     elif col_name == "dob" and val_str:
@@ -1157,8 +1158,10 @@ async def update_student(student_id: str, update_data: dict, request: Request):
         existing_school = supabase.table("students").select("school_id").eq("id", student_id).single().execute()
         if existing_school.data and existing_school.data.get("school_id"):
             ensure_unique_admission_number(update_data, existing_school.data["school_id"], current_student_id=student_id)
-        existing = supabase.table("students").select("custom_data").eq("id", student_id).single().execute()
-        update_data = preserve_schema_in_custom_data(update_data, (existing.data or {}).get("custom_data"))
+
+        # Preserve the __bizera_column_schema inside custom_data
+        existing_data = supabase.table("students").select("custom_data").eq("id", student_id).single().execute()
+        update_data = preserve_schema_in_custom_data(update_data, (existing_data.data or {}).get("custom_data"))
         
         response = supabase.table("students").update(update_data).eq("id", student_id).execute()
         return {"message": "Student updated successfully", "data": response.data}
