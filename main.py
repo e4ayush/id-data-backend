@@ -507,7 +507,23 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
         
         # Support both Excel and CSV uploads
         if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents))
+            # Auto-detect delimiter (tab vs comma) by sniffing the first line
+            import csv as _csv
+            try:
+                sample = contents.decode("utf-8-sig", errors="replace")
+                first_line = sample.split("\n")[0]
+                dialect = _csv.Sniffer().sniff(first_line, delimiters="\t,;|")
+                sep = dialect.delimiter
+            except Exception:
+                sep = ","
+            df = pd.read_csv(
+                io.BytesIO(contents),
+                sep=sep,
+                quotechar='"',
+                on_bad_lines="warn",
+                encoding="utf-8-sig",
+                engine="python",       # python engine handles multi-line quoted fields
+            )
         else:
             df = pd.read_excel(io.BytesIO(contents))
         
