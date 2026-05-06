@@ -1291,24 +1291,37 @@ async def download_photos(school_id: str, request: Request, filename_column: str
                 print(f"Error downloading {filename_in_db}: {e}")
                 return None
 
-        # Execute 10 at a time to scale for large schools without timing out
-        loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            results = await loop.run_in_executor(
-                None,
-                lambda: list(executor.map(download_single_photo, students))
-            )
+        # Stream the ZIP — write each photo as it arrives so we never hold
+        # all images in RAM simultaneously. Uses a pipe (os.pipe) between a
+        # background thread that writes the ZIP and the async generator that
+        # reads + yields chunks to the HTTP response.
+        import os, threading
 
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-            for res in results:
-                if res is not None:
-                    zip_file.writestr(res[0], res[1])
-                        
-        zip_buffer.seek(0)
+        students_with_photos = [s for s in students if s.get("photo_url")]
+
+        def generate_zip():
+            """Write photos into a ZIP and yield chunks as they're ready."""
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    for res in executor.map(download_single_photo, students_with_photos):
+                        if res is not None:
+                            zf.writestr(res[0], res[1])
+                            # Yield what's been written so far and reset buffer
+                            buf.seek(0)
+                            yield buf.read()
+                            buf.seek(0)
+                            buf.truncate(0)
+
+            # Flush any remaining ZIP footer bytes
+            buf.seek(0)
+            remaining = buf.read()
+            if remaining:
+                yield remaining
+
         return StreamingResponse(
-            zip_buffer, 
-            media_type="application/zip", 
+            generate_zip(),
+            media_type="application/zip",
             headers={"Content-Disposition": f"attachment; filename=photos_{school_id}.zip"}
         )
     except Exception as e:
