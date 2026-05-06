@@ -273,9 +273,12 @@ def photo_export_name(student):
 
 def schema_value(student, field):
     if field.get("is_photo") or field.get("key") == "photo":
+        original = (student.get("custom_data") or {}).get("_original_photo_filename", "")
+        if original:
+            return original
         if student.get("photo_url"):
             return photo_export_name(student)
-        return (student.get("custom_data") or {}).get("_original_photo_filename", "")
+        return ""
 
     key = field.get("key")
     if field.get("is_custom"):
@@ -678,8 +681,7 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
         by_name_class = {f"{str(r['name']).lower().strip()}|{str(r['class']).lower().strip()}": r for r in existing_data}
 
         inserted = 0
-        updated = 0
-        current_sheet_ids = set()
+        skipped = 0
 
         for student in student_data:
             match = None
@@ -694,34 +696,18 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 match = by_name_class[name_key]
             
             if match:
-                # OVERWRITE / UPDATE
-                student.pop("school_id", None) # Security
-                supabase.table("students").update(student).eq("id", match["id"]).execute()
-                current_sheet_ids.add(match["id"])
-                updated += 1
+                # SKIP
+                skipped += 1
             else:
                 # INSERT NEW
                 student["school_id"] = school_id
-                res = supabase.table("students").insert(student).execute()
-                if res.data:
-                    current_sheet_ids.add(res.data[0]["id"])
+                supabase.table("students").insert(student).execute()
                 inserted += 1
 
-        # 3. CLEANUP: Delete students who are NOT in the latest sheet
-        all_existing_ids = {r["id"] for r in existing_data}
-        ids_to_remove = all_existing_ids - current_sheet_ids
-        
-        removed = 0
-        if ids_to_remove:
-            for rid in ids_to_remove:
-                supabase.table("students").delete().eq("id", rid).execute()
-                removed += 1
-
         return {
-            "message": f"Sync complete: {updated} updated, {inserted} added, {removed} removed.",
+            "message": f"Upload complete: {inserted} added, {skipped} skipped (duplicates).",
             "inserted": inserted,
-            "updated": updated,
-            "removed": removed,
+            "skipped": skipped,
         }
 
     except HTTPException as he:
@@ -1281,7 +1267,9 @@ async def download_photos(school_id: str, request: Request, filename_column: str
                 if filename_column in CORE_EXPORT_FIELDS:
                     requested_value = s.get(filename_column)
                 elif filename_column == "photo":
-                    requested_value = photo_export_name(s).rsplit(".", 1)[0]
+                    requested_value = (s.get("custom_data") or {}).get("_original_photo_filename", "")
+                    if not requested_value:
+                        requested_value = photo_export_name(s).rsplit(".", 1)[0]
                 else:
                     requested_value = (s.get("custom_data") or {}).get(filename_column)
 
