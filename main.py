@@ -11,6 +11,7 @@ import io
 import uuid
 import random
 import string
+import time
 from database import supabase
 from PIL import Image
 from typing import List
@@ -378,6 +379,22 @@ def generate_password(length=10):
     chars = string.ascii_letters + string.digits + "@#$%"
     return ''.join(random.choice(chars) for _ in range(length))
 
+# ── Auth User Cache ─────────────────────────────────────────────
+# Avoids calling list_users() (which scans ALL users) on every request.
+_user_cache = {"data": None, "ts": 0}
+_USER_CACHE_TTL = 60  # seconds
+
+def _get_all_auth_users():
+    now = time.time()
+    if _user_cache["data"] is None or (now - _user_cache["ts"]) > _USER_CACHE_TTL:
+        _user_cache["data"] = list(supabase.auth.admin.list_users())
+        _user_cache["ts"] = now
+    return _user_cache["data"]
+
+def _invalidate_user_cache():
+    _user_cache["data"] = None
+    _user_cache["ts"] = 0
+
 @app.post("/create-school")
 async def create_school(school: SchoolCreate, request: Request):
     verify_admin(request)
@@ -387,10 +404,11 @@ async def create_school(school: SchoolCreate, request: Request):
         
         # 0. Cleanup any orphaned user with this email to avoid collision
         try:
-            users = supabase.auth.admin.list_users()
+            users = _get_all_auth_users()
             for u in users:
                 if getattr(u, 'email', '') == email:
                     supabase.auth.admin.delete_user(u.id)
+                    _invalidate_user_cache()
         except Exception:
             pass
 
@@ -413,6 +431,7 @@ async def create_school(school: SchoolCreate, request: Request):
                     "role": "school_admin"
                 }
             })
+            _invalidate_user_cache()
         except Exception as e:
             supabase.table("schools").delete().eq("id", school_id).execute()
             raise HTTPException(status_code=400, detail=f"User creation failed: {str(e)}")
@@ -444,7 +463,7 @@ async def get_schools(request: Request):
         schools_data = response.data
         
         try:
-            users = supabase.auth.admin.list_users()
+            users = _get_all_auth_users()
             email_map = {}
             for u in users:
                 metadata = getattr(u, 'user_metadata', {})
@@ -465,7 +484,7 @@ async def get_schools(request: Request):
 async def reset_password(school_id: str, request: Request):
     verify_admin(request)
     try:
-        users = supabase.auth.admin.list_users()
+        users = _get_all_auth_users()
         target_user = None
         for u in users:
             metadata = getattr(u, 'user_metadata', {})
@@ -478,6 +497,7 @@ async def reset_password(school_id: str, request: Request):
             
         new_password = generate_password()
         supabase.auth.admin.update_user_by_id(target_user.id, {"password": new_password})
+        _invalidate_user_cache()
         
         return {"message": "Password reset successfully", "new_password": new_password, "email": target_user.email}
     except HTTPException as he:
@@ -680,8 +700,8 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
         by_adm = {r["admission_number"]: r for r in existing_data if r.get("admission_number")}
         by_name_class = {f"{str(r['name']).lower().strip()}|{str(r['class']).lower().strip()}": r for r in existing_data}
 
-        inserted = 0
         skipped = 0
+        to_insert = []
 
         for student in student_data:
             match = None
@@ -699,10 +719,14 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 # SKIP
                 skipped += 1
             else:
-                # INSERT NEW
                 student["school_id"] = school_id
-                supabase.table("students").insert(student).execute()
-                inserted += 1
+                to_insert.append(student)
+
+        # Batch insert in chunks of 100 (avoids N individual round-trips)
+        CHUNK = 100
+        for i in range(0, len(to_insert), CHUNK):
+            supabase.table("students").insert(to_insert[i:i+CHUNK]).execute()
+        inserted = len(to_insert)
 
         return {
             "message": f"Upload complete: {inserted} added, {skipped} skipped (duplicates).",
@@ -1130,11 +1154,12 @@ async def delete_school(school_id: str, request: Request):
         
         # Clean up the associated user in Auth as well
         try:
-            users = supabase.auth.admin.list_users()
+            users = _get_all_auth_users()
             for u in users:
                 metadata = getattr(u, 'user_metadata', {})
                 if metadata and metadata.get("school_id") == school_id:
                     supabase.auth.admin.delete_user(u.id)
+                    _invalidate_user_cache()
         except Exception:
             pass
             
