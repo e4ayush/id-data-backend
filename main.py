@@ -17,6 +17,8 @@ from PIL import Image
 from typing import List
 
 SCHEMA_KEY = "__bizera_column_schema"
+ORIGINAL_PHOTO_FILENAME_KEY = "_original_photo_filename"
+PRESERVED_CUSTOM_KEYS = (SCHEMA_KEY, ORIGINAL_PHOTO_FILENAME_KEY)
 
 FIELD_MAP = {
     # ── Name ──
@@ -274,7 +276,7 @@ def photo_export_name(student):
 
 def schema_value(student, field):
     if field.get("is_photo") or field.get("key") == "photo":
-        original = (student.get("custom_data") or {}).get("_original_photo_filename", "")
+        original = (student.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
         if original:
             return original
         if student.get("photo_url"):
@@ -294,8 +296,10 @@ def preserve_schema_in_custom_data(update_data, existing_custom_data):
     if not isinstance(custom_data, dict):
         custom_data = {}
 
-    if isinstance(existing_custom_data, dict) and SCHEMA_KEY in existing_custom_data and SCHEMA_KEY not in custom_data:
-        custom_data[SCHEMA_KEY] = existing_custom_data[SCHEMA_KEY]
+    if isinstance(existing_custom_data, dict):
+        for key in PRESERVED_CUSTOM_KEYS:
+            if key in existing_custom_data and key not in custom_data:
+                custom_data[key] = existing_custom_data[key]
 
     update_data["custom_data"] = custom_data
     return update_data
@@ -586,7 +590,7 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                     
                     if col_name == "photo":
                         # Save the photo column value from CSV so it can be matched later
-                        student["custom_data"]["_original_photo_filename"] = val_str
+                        student["custom_data"][ORIGINAL_PHOTO_FILENAME_KEY] = val_str
                         continue
                     elif col_name == "dob" and val_str:
                         import re
@@ -752,7 +756,7 @@ async def upload_photo(student_id: str, file: UploadFile = File(...), request: R
 
         # 2. Delete old photo from storage to avoid orphan accumulation
         try:
-            existing = supabase.table("students").select("photo_url").eq("id", student_id).single().execute()
+            existing = supabase.table("students").select("photo_url, custom_data").eq("id", student_id).single().execute()
             old_url = existing.data.get("photo_url") if existing.data else None
             if old_url:
                 # Extract just the filename from the public URL
@@ -774,7 +778,17 @@ async def upload_photo(student_id: str, file: UploadFile = File(...), request: R
         
         # 5. Get the public URL and update the student row
         public_url = supabase.storage.from_("student-photos").get_public_url(unique_filename)
-        supabase.table("students").update({"photo_url": public_url}).eq("id", student_id).execute()
+        custom_data = (existing.data or {}).get("custom_data") if "existing" in locals() else {}
+        if not isinstance(custom_data, dict):
+            custom_data = {}
+        original_filename = os.path.basename(file.filename or "")
+        if original_filename:
+            custom_data[ORIGINAL_PHOTO_FILENAME_KEY] = original_filename
+
+        supabase.table("students").update({
+            "photo_url": public_url,
+            "custom_data": custom_data,
+        }).eq("id", student_id).execute()
         
         return {
             "message": "Photo uploaded successfully!", 
@@ -909,7 +923,16 @@ async def upload_bulk_photos(
             )
 
             public_url = supabase.storage.from_("student-photos").get_public_url(unique_filename)
-            supabase.table("students").update({"photo_url": public_url}).eq("id", student["id"]).execute()
+            custom_data = student.get("custom_data") or {}
+            if not isinstance(custom_data, dict):
+                custom_data = {}
+            if base_name:
+                custom_data[ORIGINAL_PHOTO_FILENAME_KEY] = base_name
+
+            supabase.table("students").update({
+                "photo_url": public_url,
+                "custom_data": custom_data,
+            }).eq("id", student["id"]).execute()
 
             matched += 1
         except Exception as e:
@@ -1189,6 +1212,8 @@ async def update_student(student_id: str, update_data: dict, request: Request):
         # Preserve the __bizera_column_schema inside custom_data
         existing_data = supabase.table("students").select("custom_data").eq("id", student_id).single().execute()
         update_data = preserve_schema_in_custom_data(update_data, (existing_data.data or {}).get("custom_data"))
+        if "photo_url" in update_data and update_data["photo_url"] is None and isinstance(update_data.get("custom_data"), dict):
+            update_data["custom_data"].pop(ORIGINAL_PHOTO_FILENAME_KEY, None)
         
         response = supabase.table("students").update(update_data).eq("id", student_id).execute()
         return {"message": "Student updated successfully", "data": response.data}
@@ -1292,7 +1317,7 @@ async def download_photos(school_id: str, request: Request, filename_column: str
                 if filename_column in CORE_EXPORT_FIELDS:
                     requested_value = s.get(filename_column)
                 elif filename_column == "photo":
-                    requested_value = (s.get("custom_data") or {}).get("_original_photo_filename", "")
+                    requested_value = (s.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
                     if not requested_value:
                         requested_value = photo_export_name(s).rsplit(".", 1)[0]
                 else:
