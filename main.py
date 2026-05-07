@@ -1,10 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header, Depends, Form
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 import zipfile
 import asyncio
 import concurrent.futures
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 import os
+import csv
+import html
+import tempfile
 from pydantic import BaseModel
 import pandas as pd
 import io
@@ -19,6 +23,7 @@ from typing import List
 SCHEMA_KEY = "__bizera_column_schema"
 ORIGINAL_PHOTO_FILENAME_KEY = "_original_photo_filename"
 PRESERVED_CUSTOM_KEYS = (SCHEMA_KEY, ORIGINAL_PHOTO_FILENAME_KEY)
+UPLOAD_PROGRESS = {}
 
 FIELD_MAP = {
     # ── Name ──
@@ -274,13 +279,19 @@ def photo_export_name(student):
     safe_name = "".join(c for c in str(student.get("name") or "Unknown") if c.isalnum() or c in ('-', '_', ' '))
     return f"{safe_name}_{student['id'][-4:]}.jpg"
 
+def strip_file_extension(filename):
+    base = os.path.basename(str(filename or "").strip())
+    if not base:
+        return ""
+    return base.rsplit(".", 1)[0] if "." in base else base
+
 def schema_value(student, field):
     if field.get("is_photo") or field.get("key") == "photo":
         original = (student.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
         if original:
-            return original
+            return strip_file_extension(original)
         if student.get("photo_url"):
-            return photo_export_name(student)
+            return strip_file_extension(photo_export_name(student))
         return ""
 
     key = field.get("key")
@@ -303,6 +314,29 @@ def preserve_schema_in_custom_data(update_data, existing_custom_data):
 
     update_data["custom_data"] = custom_data
     return update_data
+
+def set_upload_progress(job_id, **updates):
+    if not job_id:
+        return
+    current = UPLOAD_PROGRESS.get(job_id, {})
+    current.update({"updated_at": time.time(), **updates})
+    UPLOAD_PROGRESS[job_id] = current
+
+def cleanup_upload_progress():
+    cutoff = time.time() - 60 * 60
+    for job_id, progress in list(UPLOAD_PROGRESS.items()):
+        if progress.get("updated_at", 0) < cutoff:
+            UPLOAD_PROGRESS.pop(job_id, None)
+
+def safe_download_name(value):
+    safe = "".join(c for c in str(value or "").strip() if c.isalnum() or c in ('-', '_', ' '))
+    return safe.strip() or "download"
+
+def remove_temp_file(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 def ensure_unique_admission_number(data, school_id, current_student_id=None):
     admission_number = str(data.get("admission_number") or "").strip()
@@ -340,6 +374,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Length", "Content-Disposition"],
 )
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET")
@@ -840,6 +875,7 @@ def compress_image_to_target(image_bytes: bytes, target_kb: int = 100) -> bytes:
 async def upload_bulk_photos(
     school_id: str,
     match_column: str = Form(...),
+    job_id: str = Form(None),
     files: List[UploadFile] = File(...),
     request: Request = None,
 ):
@@ -849,12 +885,24 @@ async def upload_bulk_photos(
     Images are compressed to < 100 KB before uploading to Supabase Storage.
     """
     verify_admin(request)
+    cleanup_upload_progress()
+    set_upload_progress(
+        job_id,
+        status="processing",
+        label="Preparing photos...",
+        total=len(files),
+        processed=0,
+        matched=0,
+        skipped=0,
+        percent=0,
+    )
 
     # Fetch all students for this school
     resp = supabase.table("students").select("*").eq("school_id", school_id).execute()
     all_students = resp.data or []
 
     if not all_students:
+        set_upload_progress(job_id, status="error", label="No students found", percent=100)
         raise HTTPException(status_code=400, detail="No students found for this school")
 
     # Build a lookup: column_value -> student record
@@ -874,13 +922,18 @@ async def upload_bulk_photos(
 
         if value:
             # Normalize: strip whitespace, lowercase for matching
-            student_lookup[str(value).strip().lower()] = s
+            normalized_value = str(value).strip().lower()
+            student_lookup[normalized_value] = s
+            stripped_value = strip_file_extension(normalized_value)
+            if stripped_value:
+                student_lookup[stripped_value] = s
 
     matched = 0
     skipped = 0
     errors = []
+    total_files = len(files)
 
-    for f in files:
+    for index, f in enumerate(files, start=1):
         # Extract the filename without extension for matching
         original_name = f.filename or ""
         # Handle nested folder paths (browser sends "subfolder/image.jpg")
@@ -890,6 +943,14 @@ async def upload_bulk_photos(
 
         if not name_without_ext:
             skipped += 1
+            set_upload_progress(
+                job_id,
+                label=f"Skipped empty filename ({index}/{total_files})",
+                processed=index,
+                matched=matched,
+                skipped=skipped,
+                percent=round((index / total_files) * 100) if total_files else 100,
+            )
             continue
 
         # Do we have a matching student?
@@ -897,9 +958,25 @@ async def upload_bulk_photos(
         if not student:
             skipped += 1
             errors.append(f"No match for '{base_name}'")
+            set_upload_progress(
+                job_id,
+                label=f"No match for {base_name}",
+                processed=index,
+                matched=matched,
+                skipped=skipped,
+                percent=round((index / total_files) * 100) if total_files else 100,
+            )
             continue
 
         try:
+            set_upload_progress(
+                job_id,
+                label=f"Processing {base_name}",
+                processed=index - 1,
+                matched=matched,
+                skipped=skipped,
+                percent=round(((index - 1) / total_files) * 100) if total_files else 0,
+            )
             contents = await f.read()
 
             # Compress to under 100 KB
@@ -938,13 +1015,45 @@ async def upload_bulk_photos(
         except Exception as e:
             errors.append(f"Error processing '{base_name}': {str(e)}")
             skipped += 1
+        finally:
+            set_upload_progress(
+                job_id,
+                label=f"Processed {index} of {total_files}",
+                processed=index,
+                matched=matched,
+                skipped=skipped,
+                percent=round((index / total_files) * 100) if total_files else 100,
+            )
 
+    set_upload_progress(
+        job_id,
+        status="complete",
+        label="Upload complete",
+        processed=total_files,
+        matched=matched,
+        skipped=skipped,
+        percent=100,
+    )
     return {
         "message": f"Bulk upload complete: {matched} matched, {skipped} skipped.",
         "matched": matched,
         "skipped": skipped,
         "errors": errors[:20],  # Cap error list so response isn't huge
     }
+
+@app.get("/upload-progress/{job_id}")
+async def upload_progress(job_id: str, request: Request):
+    verify_admin(request)
+    cleanup_upload_progress()
+    return UPLOAD_PROGRESS.get(job_id, {
+        "status": "pending",
+        "label": "Waiting for upload...",
+        "total": 0,
+        "processed": 0,
+        "matched": 0,
+        "skipped": 0,
+        "percent": 0,
+    })
 
 # ---------------------------------------------------------
 # MOBILE APP ROUTES (Protected by Supabase JWT)
@@ -1304,6 +1413,85 @@ async def export_students(school_id: str, request: Request):
         print(f"Export Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to export student data. Please try again.")
 
+@app.get("/export-file/{school_id}")
+async def export_students_file(
+    school_id: str,
+    request: Request,
+    class_filter: str = "All",
+    file_format: str = "xlsx",
+):
+    verify_admin(request)
+    try:
+        response = supabase.table("students").select("*").eq("school_id", school_id).order("class").execute()
+        students = [format_dob_for_frontend(s) for s in response.data]
+        if class_filter and class_filter != "All":
+            students = [s for s in students if str(s.get("class") or "").strip() == class_filter]
+
+        column_schema = get_schema_from_students(students)
+        flattened = []
+        for s in students:
+            row = {}
+            for field in column_schema:
+                header = field.get("header") or DISPLAY_LABELS.get(field.get("key"), field.get("key"))
+                if header:
+                    row[header] = schema_value(s, field)
+            flattened.append(row)
+
+        if not flattened:
+            raise HTTPException(status_code=404, detail="No data to export")
+
+        headers = [
+            field.get("header") or DISPLAY_LABELS.get(field.get("key"), field.get("key"))
+            for field in column_schema
+            if field.get("header") or field.get("key")
+        ]
+        class_suffix = "All_Classes" if class_filter == "All" else f"Class_{safe_download_name(class_filter)}"
+        base_filename = f"students_{safe_download_name(school_id)}_{class_suffix}"
+        export_format = (file_format or "xlsx").lower()
+
+        if export_format == "csv":
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", newline="", encoding="utf-8-sig")
+            with tmp:
+                writer = csv.DictWriter(tmp, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(flattened)
+            return FileResponse(
+                tmp.name,
+                media_type="text/csv",
+                filename=f"{base_filename}.csv",
+                background=BackgroundTask(remove_temp_file, tmp.name),
+            )
+
+        if export_format == "xls":
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xls", mode="w", encoding="utf-8")
+            with tmp:
+                tmp.write("<html><head><meta charset='utf-8'></head><body><table>")
+                tmp.write("<tr>" + "".join(f"<th>{html.escape(str(h))}</th>" for h in headers) + "</tr>")
+                for row in flattened:
+                    tmp.write("<tr>" + "".join(f"<td>{html.escape(str(row.get(h, '') or ''))}</td>" for h in headers) + "</tr>")
+                tmp.write("</table></body></html>")
+            return FileResponse(
+                tmp.name,
+                media_type="application/vnd.ms-excel",
+                filename=f"{base_filename}.xls",
+                background=BackgroundTask(remove_temp_file, tmp.name),
+            )
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+        tmp.close()
+        pd.DataFrame(flattened, columns=headers).to_excel(tmp.name, index=False, engine="openpyxl")
+        return FileResponse(
+            tmp.name,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"{base_filename}.xlsx",
+            background=BackgroundTask(remove_temp_file, tmp.name),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Export File Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to export student file. Please try again.")
+
 @app.get("/download-photos/{school_id}")
 async def download_photos(school_id: str, request: Request, filename_column: str = None):
     """Download a ZIP file of all photos for a school"""
@@ -1319,16 +1507,16 @@ async def download_photos(school_id: str, request: Request, filename_column: str
                 elif filename_column == "photo":
                     requested_value = (s.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
                     if not requested_value:
-                        requested_value = photo_export_name(s).rsplit(".", 1)[0]
+                        requested_value = strip_file_extension(photo_export_name(s))
                 else:
                     requested_value = (s.get("custom_data") or {}).get(filename_column)
 
                 if requested_value:
-                    safe_value = "".join(c for c in str(requested_value).strip() if c.isalnum() or c in ('-', '_', ' '))
+                    safe_value = "".join(c for c in strip_file_extension(requested_value) if c.isalnum() or c in ('-', '_', ' '))
                     if safe_value:
-                        return f"{safe_value}.jpg"
+                        return safe_value
 
-            return photo_export_name(s)
+            return strip_file_extension(photo_export_name(s))
 
         def download_single_photo(s):
             url = s.get("photo_url")
@@ -1341,39 +1529,26 @@ async def download_photos(school_id: str, request: Request, filename_column: str
                 print(f"Error downloading {filename_in_db}: {e}")
                 return None
 
-        # Stream the ZIP — write each photo as it arrives so we never hold
-        # all images in RAM simultaneously. Uses a pipe (os.pipe) between a
-        # background thread that writes the ZIP and the async generator that
-        # reads + yields chunks to the HTTP response.
-        import os, threading
-
         students_with_photos = [s for s in students if s.get("photo_url")]
+        if not students_with_photos:
+            raise HTTPException(status_code=404, detail="No photos available for this school")
 
-        def generate_zip():
-            """Write photos into a ZIP and yield chunks as they're ready."""
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                    for res in executor.map(download_single_photo, students_with_photos):
-                        if res is not None:
-                            zf.writestr(res[0], res[1])
-                            # Yield what's been written so far and reset buffer
-                            buf.seek(0)
-                            yield buf.read()
-                            buf.seek(0)
-                            buf.truncate(0)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp.close()
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                for res in executor.map(download_single_photo, students_with_photos):
+                    if res is not None:
+                        zf.writestr(res[0], res[1])
 
-            # Flush any remaining ZIP footer bytes
-            buf.seek(0)
-            remaining = buf.read()
-            if remaining:
-                yield remaining
-
-        return StreamingResponse(
-            generate_zip(),
+        return FileResponse(
+            tmp.name,
             media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename=photos_{school_id}.zip"}
+            filename=f"photos_{safe_download_name(school_id)}.zip",
+            background=BackgroundTask(remove_temp_file, tmp.name),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Download Photos Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to securely package your photos. Please try again.")
