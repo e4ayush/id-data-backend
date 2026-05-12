@@ -86,6 +86,26 @@ class TestFormatDob:
         assert back_to_db["dob"] == "2010-05-15"
 
 
+class TestPhotoDownloadFilename:
+    """Tests for photo filenames written inside downloaded ZIP archives"""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        os.environ.setdefault("ADMIN_SECRET", "test_secret_123")
+        os.environ.setdefault("SUPABASE_URL", "https://fake.supabase.co")
+        os.environ.setdefault("SUPABASE_KEY", "fake_key")
+
+    def test_photo_download_filename_adds_jpg_extension(self):
+        from main import photo_download_filename
+
+        assert photo_download_filename("MPS-1001") == "MPS-1001.jpg"
+
+    def test_photo_download_filename_replaces_original_extension(self):
+        from main import photo_download_filename
+
+        assert photo_download_filename("folder/student photo.png") == "student photo.jpg"
+
+
 class TestGeneratePassword:
     """Tests for password generation"""
     

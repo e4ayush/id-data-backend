@@ -285,6 +285,10 @@ def strip_file_extension(filename):
         return ""
     return base.rsplit(".", 1)[0] if "." in base else base
 
+def photo_download_filename(value):
+    safe_value = "".join(c for c in strip_file_extension(value) if c.isalnum() or c in ('-', '_', ' ')).strip()
+    return f"{safe_value or 'photo'}.jpg"
+
 def schema_value(student, field):
     if field.get("is_photo") or field.get("key") == "photo":
         original = (student.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
@@ -1512,11 +1516,9 @@ async def download_photos(school_id: str, request: Request, filename_column: str
                     requested_value = (s.get("custom_data") or {}).get(filename_column)
 
                 if requested_value:
-                    safe_value = "".join(c for c in strip_file_extension(requested_value) if c.isalnum() or c in ('-', '_', ' '))
-                    if safe_value:
-                        return safe_value
+                    return photo_download_filename(requested_value)
 
-            return strip_file_extension(photo_export_name(s))
+            return photo_download_filename(photo_export_name(s))
 
         def download_single_photo(s):
             url = s.get("photo_url")
