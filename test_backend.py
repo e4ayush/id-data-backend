@@ -85,6 +85,20 @@ class TestFormatDob:
         back_to_db = format_dob_for_db(dict(frontend))
         assert back_to_db["dob"] == "2010-05-15"
 
+    def test_format_dob_excel_safe_uses_double_dash(self):
+        """Only the Excel/CSV export keeps the doubled separator"""
+        from main import format_dob_for_frontend
+        assert format_dob_for_frontend({"dob": "2021-03-06"})["dob"] == "06-03-2021"
+        assert format_dob_for_frontend({"dob": "2021-03-06"}, excel_safe=True)["dob"] == "06--03--2021"
+
+    def test_format_dob_custom_data_date_field(self):
+        """Date-like custom_data fields (typed as DD-MM-YYYY) use the display format"""
+        from main import format_dob_for_frontend
+        student = {"dob": "2021-03-06", "custom_data": {"admission_date": "15-05-2010"}}
+        result = format_dob_for_frontend(student)
+        assert result["custom_data"]["admission_date"] == "15-05-2010"
+        assert format_dob_for_frontend(student, excel_safe=True)["custom_data"]["admission_date"] == "15--05--2010"
+
 
 class TestPhotoDownloadFilename:
     """Tests for photo filenames written inside downloaded ZIP archives"""
@@ -375,6 +389,17 @@ class TestAPIEndpoints:
         except Exception:
             pytest.skip("Server dependencies not available for integration test")
 
+    def test_download_selected_photos_no_auth(self):
+        """POST /download-photos/fake-id without auth should fail"""
+        try:
+            from main import app
+            from fastapi.testclient import TestClient
+            client = TestClient(app)
+            response = client.post("/download-photos/fake-id", json={"student_ids": ["abc"]})
+            assert response.status_code == 401
+        except Exception:
+            pytest.skip("Server dependencies not available for integration test")
+
     def test_export_students_no_auth(self):
         """GET /export-students/fake-id without auth should fail"""
         try:
@@ -473,3 +498,170 @@ class TestEdgeCases:
         from main import verify_school_user
         with pytest.raises(Exception):
             verify_school_user("Bearer ")
+
+
+# ── Export / re-upload helpers ─────────────────────────────────────────────────
+
+class TestExportHelpers:
+    """Tests for the helpers that decide how dates survive an Excel round-trip"""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        os.environ.setdefault("ADMIN_SECRET", "test_secret_123")
+        os.environ.setdefault("SUPABASE_URL", "https://fake.supabase.co")
+        os.environ.setdefault("SUPABASE_KEY", "fake_key")
+
+    def test_date_like_headers_detected(self):
+        from main import is_date_like_header
+        assert is_date_like_header("Date of Birth")
+        assert is_date_like_header("dob")
+        assert is_date_like_header("Admission Date")
+        assert is_date_like_header("BIRTH DATE")
+
+    def test_non_date_headers_ignored(self):
+        from main import is_date_like_header
+        assert not is_date_like_header("Name")
+        assert not is_date_like_header("Phone")
+        assert not is_date_like_header("Roll Number")
+        assert not is_date_like_header(None)
+        assert not is_date_like_header("")
+
+    def test_xls_text_style_is_well_formed(self):
+        from main import EXCEL_TEXT_CELL_STYLE
+        assert "mso-number-format" in EXCEL_TEXT_CELL_STYLE
+        assert EXCEL_TEXT_CELL_STYLE.startswith(' style="')
+
+
+class _FakeResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class _FakeStudentsTable:
+    """Minimal stand-in for supabase.table('students') on the upload path."""
+
+    def __init__(self, store):
+        self.store = store
+        self.mode = None
+        self.payload = None
+        self.kwargs = {}
+        self.filters = {}
+
+    def select(self, *args, **kwargs):
+        self.mode = "select"
+        return self
+
+    def eq(self, column, value):
+        self.filters[column] = value
+        return self
+
+    def insert(self, rows):
+        self.mode = "insert"
+        self.payload = rows
+        return self
+
+    def upsert(self, rows, **kwargs):
+        self.mode = "upsert"
+        self.payload = rows
+        self.kwargs = kwargs
+        return self
+
+    def execute(self):
+        if self.mode == "select":
+            wanted = self.filters.get("school_id")
+            return _FakeResult([r for r in self.store["rows"] if r.get("school_id") == wanted])
+        if self.mode == "insert":
+            self.store["inserted"].extend(self.payload)
+            return _FakeResult(self.payload)
+        self.store["upsert_kwargs"].append(self.kwargs)
+        self.store["upserted"].extend(self.payload)
+        return _FakeResult(self.payload)
+
+
+class _FakeSupabase:
+    def __init__(self, store):
+        self.store = store
+
+    def table(self, name):
+        return _FakeStudentsTable(self.store)
+
+
+class TestUploadOverwrite:
+    """Re-uploading a sheet must UPDATE existing students, not silently skip them"""
+
+    SCHOOL = "11111111-1111-1111-1111-111111111111"
+    EXISTING_ID = "22222222-2222-2222-2222-222222222222"
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        os.environ.setdefault("ADMIN_SECRET", "test_secret_123")
+        os.environ.setdefault("SUPABASE_URL", "https://fake.supabase.co")
+        os.environ.setdefault("SUPABASE_KEY", "fake_key")
+
+    def run_upload(self, monkeypatch, csv_text):
+        import main
+        from fastapi.testclient import TestClient
+
+        store = {
+            "rows": [{
+                "id": self.EXISTING_ID,
+                "school_id": self.SCHOOL,
+                "name": "Old Name",
+                "class": "5",
+                "admission_number": "1001",
+                "phone": "9999999999",
+                "photo_url": "https://example.test/photo.jpg",
+                "custom_data": {"_original_photo_filename": "old.jpg"},
+                "created_at": "2024-01-01T00:00:00Z",
+            }],
+            "inserted": [],
+            "upserted": [],
+            "upsert_kwargs": [],
+        }
+        monkeypatch.setattr(main, "supabase", _FakeSupabase(store))
+
+        client = TestClient(main.app)
+        response = client.post(
+            f"/upload-excel/{self.SCHOOL}",
+            headers={"X-Admin-Secret": main.ADMIN_SECRET},
+            files={"file": ("students.csv", csv_text.encode(), "text/csv")},
+        )
+        return response, store
+
+    def test_existing_student_is_updated_not_skipped(self, monkeypatch):
+        csv_text = (
+            "Name,Class,Admission Number,Phone\n"
+            "New Name,5,1001,8888888888\n"
+            "Fresh Student,6,1002,7777777777\n"
+        )
+        response, store = self.run_upload(monkeypatch, csv_text)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["inserted"] == 1, body
+        assert body["updated"] == 1, body
+
+        assert len(store["upserted"]) == 1
+        updated = store["upserted"][0]
+        assert updated["id"] == self.EXISTING_ID
+        assert updated["name"] == "New Name"
+        assert updated["phone"] == "8888888888"
+
+        assert len(store["inserted"]) == 1
+        assert store["inserted"][0]["name"] == "Fresh Student"
+
+    def test_update_preserves_photo_and_original_filename(self, monkeypatch):
+        csv_text = "Name,Class,Admission Number,Phone\nNew Name,5,1001,8888888888\n"
+        _, store = self.run_upload(monkeypatch, csv_text)
+
+        updated = store["upserted"][0]
+        assert updated["photo_url"] == "https://example.test/photo.jpg"
+        assert updated["custom_data"]["_original_photo_filename"] == "old.jpg"
+
+    def test_upsert_targets_id_without_nulling_missing_columns(self, monkeypatch):
+        csv_text = "Name,Class,Admission Number,Phone\nNew Name,5,1001,8888888888\n"
+        _, store = self.run_upload(monkeypatch, csv_text)
+
+        kwargs = store["upsert_kwargs"][0]
+        assert kwargs.get("on_conflict") == "id"
+        assert kwargs.get("default_to_null") is False

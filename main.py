@@ -18,7 +18,8 @@ import string
 import time
 from database import supabase
 from PIL import Image
-from typing import List
+from openpyxl import load_workbook
+from typing import List, Optional
 
 SCHEMA_KEY = "__bizera_column_schema"
 ORIGINAL_PHOTO_FILENAME_KEY = "_original_photo_filename"
@@ -148,19 +149,24 @@ def display_header_for_key(key):
         str(key).replace("_", " ").title()
     )
 
-def format_dob_for_frontend(student):
-    """Converts DB YYYY-MM-DD to DD--MM--YYYY for display/export to prevent Excel auto-format"""
+def format_dob_for_frontend(student, excel_safe=False):
+    """Converts DB YYYY-MM-DD to DD-MM-YYYY for display.
+
+    When excel_safe is True the separators are doubled (DD--MM--YYYY) so that
+    Excel treats the value as text instead of auto-converting it into a date.
+    """
     import re
+    date_format = "%d--%m--%Y" if excel_safe else "%d-%m-%Y"
     # 1. Format core dob field
     dob = student.get("dob")
     if dob and str(dob).strip():
         try:
-            # Standardize separators to single dash first, then format to double dash
+            # Standardize separators to single dash first, then apply the output format
             clean_val = re.sub(r'[\.\/\\\-]+', '-', str(dob))
-            student["dob"] = pd.to_datetime(clean_val).strftime("%d--%m--%Y")
+            student["dob"] = pd.to_datetime(clean_val).strftime(date_format)
         except Exception:
             pass
-            
+
     # 2. Aggressively format any other fields that look like dates in custom_data
     custom_data = student.get("custom_data")
     if isinstance(custom_data, dict):
@@ -170,7 +176,7 @@ def format_dob_for_frontend(student):
                 if v and str(v).strip() and len(str(v)) >= 8:
                     try:
                         clean_v = re.sub(r'[\.\/\\\-]+', '-', str(v))
-                        student["custom_data"][k] = pd.to_datetime(clean_v, dayfirst=True).strftime("%d--%m--%Y")
+                        student["custom_data"][k] = pd.to_datetime(clean_v, dayfirst=True).strftime(date_format)
                     except Exception:
                         pass
     return student
@@ -336,6 +342,20 @@ def safe_download_name(value):
     safe = "".join(c for c in str(value or "").strip() if c.isalnum() or c in ('-', '_', ' '))
     return safe.strip() or "download"
 
+# Tells Excel an HTML-exported cell is text, so it stops guessing it is a date.
+EXCEL_TEXT_CELL_STYLE = " style=\"mso-number-format:'\\@'\""
+
+def is_date_like_header(header):
+    label = str(header or "").lower()
+    return "date" in label or "dob" in label or "birth" in label
+
+def school_display_name(school_id):
+    try:
+        response = supabase.table("schools").select("name").eq("id", school_id).single().execute()
+        return (response.data or {}).get("name") or school_id
+    except Exception:
+        return school_id
+
 def remove_temp_file(path):
     try:
         os.unlink(path)
@@ -416,6 +436,10 @@ class SchoolCreate(BaseModel):
 
 class BulkDeleteRequest(BaseModel):
     ids: List[str]
+
+class PhotoDownloadRequest(BaseModel):
+    filename_column: Optional[str] = None
+    student_ids: Optional[List[str]] = None
 
 def generate_password(length=10):
     """Generates a random 10-character password"""
@@ -725,56 +749,66 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 detail={"message": "Validation failed", "errors": validation_errors}
             )
 
-        # ── Safe Upsert Strategy ──────────────────────────────────────────
-        # Split students into those with an admission_number (can be matched)
-        # and those without (must be inserted fresh).
-        #
-        # For students WITH admission_number:
-        #   - If the school already has a matching record → UPDATE it (keeps photo!)
-        #   - If no match → INSERT as new
-        # For students WITHOUT admission_number → INSERT as new
-        #
-        # ── Bulletproof Overwrite Strategy ────────────────────────────────
-        # Fetch existing students for this school
-        existing = supabase.table("students").select("id, name, class, admission_number, photo_url").eq("school_id", school_id).execute()
+        # ── Overwrite Strategy ────────────────────────────────────────────
+        # Students that already exist (matched by admission number, falling back
+        # to name + class) are UPDATED with the values from the sheet, so a
+        # corrected re-upload actually takes effect. Photos are preserved.
+        # Everyone else is inserted.
+        existing = supabase.table("students").select("*").eq("school_id", school_id).execute()
         existing_data = existing.data or []
-        
+
         # Build lookup maps
         by_adm = {r["admission_number"]: r for r in existing_data if r.get("admission_number")}
         by_name_class = {f"{str(r['name']).lower().strip()}|{str(r['class']).lower().strip()}": r for r in existing_data}
 
-        skipped = 0
         to_insert = []
+        to_update = []
 
         for student in student_data:
             match = None
             adm = student.get("admission_number")
             name_key = f"{str(student.get('name')).lower().strip()}|{str(student.get('class')).lower().strip()}"
-            
+
             # 1. Match by Admission Number (Highest priority)
             if adm and adm in by_adm:
                 match = by_adm[adm]
             # 2. Fallback: Match by Name + Class
             elif name_key in by_name_class:
                 match = by_name_class[name_key]
-            
+
             if match:
-                # SKIP
-                skipped += 1
+                # Start from the existing row so columns the sheet does not
+                # mention (photo_url, created_at, ...) keep their current values.
+                payload = dict(match)
+                payload.update({k: v for k, v in student.items() if k != "school_id"})
+                existing_custom = match.get("custom_data") or {}
+                sheet_custom = student.get("custom_data") or {}
+                if isinstance(existing_custom, dict) and isinstance(sheet_custom, dict):
+                    payload["custom_data"] = {**existing_custom, **sheet_custom}
+                payload = preserve_schema_in_custom_data(payload, existing_custom)
+                to_update.append(payload)
             else:
                 student["school_id"] = school_id
                 to_insert.append(student)
 
-        # Batch insert in chunks of 100 (avoids N individual round-trips)
+        # Batch in chunks of 100 (avoids N individual round-trips)
         CHUNK = 100
         for i in range(0, len(to_insert), CHUNK):
             supabase.table("students").insert(to_insert[i:i+CHUNK]).execute()
+        # default_to_null=False so columns absent from the payload are left alone;
+        # otherwise the upsert would blank out photo_url on every updated row.
+        for i in range(0, len(to_update), CHUNK):
+            supabase.table("students").upsert(
+                to_update[i:i+CHUNK], on_conflict="id", default_to_null=False
+            ).execute()
+
         inserted = len(to_insert)
+        updated = len(to_update)
 
         return {
-            "message": f"Upload complete: {inserted} added, {skipped} skipped (duplicates).",
+            "message": f"Upload complete: {inserted} added, {updated} updated.",
             "inserted": inserted,
-            "skipped": skipped,
+            "updated": updated,
         }
 
     except HTTPException as he:
@@ -1426,8 +1460,12 @@ async def export_students_file(
 ):
     verify_admin(request)
     try:
+        export_format = (file_format or "xlsx").lower()
+
         response = supabase.table("students").select("*").eq("school_id", school_id).order("class").execute()
-        students = [format_dob_for_frontend(s) for s in response.data]
+        # Excel type-guesses plain-text CSV, so only that format keeps the doubled
+        # separator. XLSX/XLS carry real types and get a normal DD-MM-YYYY.
+        students = [format_dob_for_frontend(s, excel_safe=(export_format == "csv")) for s in response.data]
         if class_filter and class_filter != "All":
             students = [s for s in students if str(s.get("class") or "").strip() == class_filter]
 
@@ -1450,8 +1488,7 @@ async def export_students_file(
             if field.get("header") or field.get("key")
         ]
         class_suffix = "All_Classes" if class_filter == "All" else f"Class_{safe_download_name(class_filter)}"
-        base_filename = f"students_{safe_download_name(school_id)}_{class_suffix}"
-        export_format = (file_format or "xlsx").lower()
+        base_filename = f"{safe_download_name(school_display_name(school_id))}_{class_suffix}_Students"
 
         if export_format == "csv":
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", newline="", encoding="utf-8-sig")
@@ -1472,7 +1509,12 @@ async def export_students_file(
                 tmp.write("<html><head><meta charset='utf-8'></head><body><table>")
                 tmp.write("<tr>" + "".join(f"<th>{html.escape(str(h))}</th>" for h in headers) + "</tr>")
                 for row in flattened:
-                    tmp.write("<tr>" + "".join(f"<td>{html.escape(str(row.get(h, '') or ''))}</td>" for h in headers) + "</tr>")
+                    cells = "".join(
+                        f"<td{EXCEL_TEXT_CELL_STYLE if is_date_like_header(h) else ''}>"
+                        f"{html.escape(str(row.get(h, '') or ''))}</td>"
+                        for h in headers
+                    )
+                    tmp.write(f"<tr>{cells}</tr>")
                 tmp.write("</table></body></html>")
             return FileResponse(
                 tmp.name,
@@ -1484,6 +1526,16 @@ async def export_students_file(
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
         tmp.close()
         pd.DataFrame(flattened, columns=headers).to_excel(tmp.name, index=False, engine="openpyxl")
+
+        # Pin date columns to Text so Excel shows them exactly as written.
+        workbook = load_workbook(tmp.name)
+        sheet = workbook.active
+        date_columns = [cell.column for cell in sheet[1] if is_date_like_header(cell.value)]
+        for column in date_columns:
+            for (cell,) in sheet.iter_rows(min_col=column, max_col=column, min_row=2):
+                cell.number_format = "@"
+        workbook.save(tmp.name)
+
         return FileResponse(
             tmp.name,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1496,59 +1548,82 @@ async def export_students_file(
         print(f"Export File Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to export student file. Please try again.")
 
+def build_photos_zip(school_id: str, filename_column: str = None, student_ids: List[str] = None):
+    """Packages student photos into a ZIP. Limits photos to student_ids when provided."""
+    response = supabase.table("students").select("*").eq("school_id", school_id).execute()
+    students = response.data or []
+
+    if student_ids:
+        wanted = set(student_ids)
+        students = [s for s in students if s.get("id") in wanted]
+
+    def zip_photo_name(s):
+        if filename_column:
+            if filename_column in CORE_EXPORT_FIELDS:
+                requested_value = s.get(filename_column)
+            elif filename_column == "photo":
+                requested_value = (s.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
+                if not requested_value:
+                    requested_value = strip_file_extension(photo_export_name(s))
+            else:
+                requested_value = (s.get("custom_data") or {}).get(filename_column)
+
+            if requested_value:
+                return photo_download_filename(requested_value)
+
+        return photo_download_filename(photo_export_name(s))
+
+    def download_single_photo(s):
+        url = s.get("photo_url")
+        if not url: return None
+        filename_in_db = url.split("/")[-1].split("?")[0]
+        try:
+            photo_bytes = supabase.storage.from_("student-photos").download(filename_in_db)
+            return (zip_photo_name(s), photo_bytes)
+        except Exception as e:
+            print(f"Error downloading {filename_in_db}: {e}")
+            return None
+
+    students_with_photos = [s for s in students if s.get("photo_url")]
+    if not students_with_photos:
+        detail = "No photos available for the selected students" if student_ids else "No photos available for this school"
+        raise HTTPException(status_code=404, detail=detail)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.close()
+    with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            for res in executor.map(download_single_photo, students_with_photos):
+                if res is not None:
+                    zf.writestr(res[0], res[1])
+
+    scope_suffix = "_selected" if student_ids else ""
+    return FileResponse(
+        tmp.name,
+        media_type="application/zip",
+        filename=f"photos_{safe_download_name(school_display_name(school_id))}{scope_suffix}.zip",
+        background=BackgroundTask(remove_temp_file, tmp.name),
+    )
+
 @app.get("/download-photos/{school_id}")
 async def download_photos(school_id: str, request: Request, filename_column: str = None):
     """Download a ZIP file of all photos for a school"""
     verify_admin(request)
     try:
-        response = supabase.table("students").select("*").eq("school_id", school_id).execute()
-        students = response.data or []
+        return build_photos_zip(school_id, filename_column)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Download Photos Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to securely package your photos. Please try again.")
 
-        def zip_photo_name(s):
-            if filename_column:
-                if filename_column in CORE_EXPORT_FIELDS:
-                    requested_value = s.get(filename_column)
-                elif filename_column == "photo":
-                    requested_value = (s.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
-                    if not requested_value:
-                        requested_value = strip_file_extension(photo_export_name(s))
-                else:
-                    requested_value = (s.get("custom_data") or {}).get(filename_column)
-
-                if requested_value:
-                    return photo_download_filename(requested_value)
-
-            return photo_download_filename(photo_export_name(s))
-
-        def download_single_photo(s):
-            url = s.get("photo_url")
-            if not url: return None
-            filename_in_db = url.split("/")[-1].split("?")[0]
-            try:
-                photo_bytes = supabase.storage.from_("student-photos").download(filename_in_db)
-                return (zip_photo_name(s), photo_bytes)
-            except Exception as e:
-                print(f"Error downloading {filename_in_db}: {e}")
-                return None
-
-        students_with_photos = [s for s in students if s.get("photo_url")]
-        if not students_with_photos:
-            raise HTTPException(status_code=404, detail="No photos available for this school")
-
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        tmp.close()
-        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                for res in executor.map(download_single_photo, students_with_photos):
-                    if res is not None:
-                        zf.writestr(res[0], res[1])
-
-        return FileResponse(
-            tmp.name,
-            media_type="application/zip",
-            filename=f"photos_{safe_download_name(school_id)}.zip",
-            background=BackgroundTask(remove_temp_file, tmp.name),
-        )
+@app.post("/download-photos/{school_id}")
+async def download_selected_photos(school_id: str, request: Request, payload: Optional[PhotoDownloadRequest] = None):
+    """Download a ZIP file of photos for the selected students only"""
+    verify_admin(request)
+    try:
+        payload = payload or PhotoDownloadRequest()
+        return build_photos_zip(school_id, payload.filename_column, payload.student_ids)
     except HTTPException:
         raise
     except Exception as e:
