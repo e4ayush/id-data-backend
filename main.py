@@ -441,6 +441,11 @@ class PhotoDownloadRequest(BaseModel):
     filename_column: Optional[str] = None
     student_ids: Optional[List[str]] = None
 
+class ExportRequest(BaseModel):
+    student_ids: Optional[List[str]] = None
+    class_filter: str = "All"
+    file_format: str = "xlsx"
+
 def generate_password(length=10):
     """Generates a random 10-character password"""
     chars = string.ascii_letters + string.digits + "@#$%"
@@ -1451,6 +1456,103 @@ async def export_students(school_id: str, request: Request):
         print(f"Export Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to export student data. Please try again.")
 
+def build_export_file(school_id, file_format="xlsx", class_filter="All", student_ids=None):
+    """Builds the export file. An explicit student_ids list wins over class_filter."""
+    export_format = (file_format or "xlsx").lower()
+
+    response = supabase.table("students").select("*").eq("school_id", school_id).order("class").execute()
+    rows = response.data or []
+
+    if student_ids is not None:
+        wanted = set(student_ids)
+        rows = [s for s in rows if s.get("id") in wanted]
+    elif class_filter and class_filter != "All":
+        rows = [s for s in rows if str(s.get("class") or "").strip() == class_filter]
+
+    # Excel type-guesses plain-text CSV, so only that format keeps the doubled
+    # separator. XLSX/XLS carry real types and get a normal DD-MM-YYYY.
+    students = [format_dob_for_frontend(s, excel_safe=(export_format == "csv")) for s in rows]
+
+    column_schema = get_schema_from_students(students)
+    flattened = []
+    for s in students:
+        row = {}
+        for field in column_schema:
+            header = field.get("header") or DISPLAY_LABELS.get(field.get("key"), field.get("key"))
+            if header:
+                row[header] = schema_value(s, field)
+        flattened.append(row)
+
+    if not flattened:
+        raise HTTPException(status_code=404, detail="No data to export")
+
+    headers = [
+        field.get("header") or DISPLAY_LABELS.get(field.get("key"), field.get("key"))
+        for field in column_schema
+        if field.get("header") or field.get("key")
+    ]
+
+    if student_ids is not None:
+        scope_suffix = f"Selected_{len(flattened)}_Students"
+    elif class_filter and class_filter != "All":
+        scope_suffix = f"Class_{safe_download_name(class_filter)}_Students"
+    else:
+        scope_suffix = "All_Classes_Students"
+    base_filename = f"{safe_download_name(school_display_name(school_id))}_{scope_suffix}"
+
+    if export_format == "csv":
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", newline="", encoding="utf-8-sig")
+        with tmp:
+            writer = csv.DictWriter(tmp, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(flattened)
+        return FileResponse(
+            tmp.name,
+            media_type="text/csv",
+            filename=f"{base_filename}.csv",
+            background=BackgroundTask(remove_temp_file, tmp.name),
+        )
+
+    if export_format == "xls":
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xls", mode="w", encoding="utf-8")
+        with tmp:
+            tmp.write("<html><head><meta charset='utf-8'></head><body><table>")
+            tmp.write("<tr>" + "".join(f"<th>{html.escape(str(h))}</th>" for h in headers) + "</tr>")
+            for row in flattened:
+                cells = "".join(
+                    f"<td{EXCEL_TEXT_CELL_STYLE if is_date_like_header(h) else ''}>"
+                    f"{html.escape(str(row.get(h, '') or ''))}</td>"
+                    for h in headers
+                )
+                tmp.write(f"<tr>{cells}</tr>")
+            tmp.write("</table></body></html>")
+        return FileResponse(
+            tmp.name,
+            media_type="application/vnd.ms-excel",
+            filename=f"{base_filename}.xls",
+            background=BackgroundTask(remove_temp_file, tmp.name),
+        )
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    tmp.close()
+    pd.DataFrame(flattened, columns=headers).to_excel(tmp.name, index=False, engine="openpyxl")
+
+    # Pin date columns to Text so Excel shows them exactly as written.
+    workbook = load_workbook(tmp.name)
+    sheet = workbook.active
+    date_columns = [cell.column for cell in sheet[1] if is_date_like_header(cell.value)]
+    for column in date_columns:
+        for (cell,) in sheet.iter_rows(min_col=column, max_col=column, min_row=2):
+            cell.number_format = "@"
+    workbook.save(tmp.name)
+
+    return FileResponse(
+        tmp.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{base_filename}.xlsx",
+        background=BackgroundTask(remove_temp_file, tmp.name),
+    )
+
 @app.get("/export-file/{school_id}")
 async def export_students_file(
     school_id: str,
@@ -1458,89 +1560,33 @@ async def export_students_file(
     class_filter: str = "All",
     file_format: str = "xlsx",
 ):
+    """Legacy class-scoped export. Kept so an already-deployed dashboard keeps working."""
     verify_admin(request)
     try:
-        export_format = (file_format or "xlsx").lower()
+        return build_export_file(school_id, file_format=file_format, class_filter=class_filter)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Export File Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to export student file. Please try again.")
 
-        response = supabase.table("students").select("*").eq("school_id", school_id).order("class").execute()
-        # Excel type-guesses plain-text CSV, so only that format keeps the doubled
-        # separator. XLSX/XLS carry real types and get a normal DD-MM-YYYY.
-        students = [format_dob_for_frontend(s, excel_safe=(export_format == "csv")) for s in response.data]
-        if class_filter and class_filter != "All":
-            students = [s for s in students if str(s.get("class") or "").strip() == class_filter]
-
-        column_schema = get_schema_from_students(students)
-        flattened = []
-        for s in students:
-            row = {}
-            for field in column_schema:
-                header = field.get("header") or DISPLAY_LABELS.get(field.get("key"), field.get("key"))
-                if header:
-                    row[header] = schema_value(s, field)
-            flattened.append(row)
-
-        if not flattened:
-            raise HTTPException(status_code=404, detail="No data to export")
-
-        headers = [
-            field.get("header") or DISPLAY_LABELS.get(field.get("key"), field.get("key"))
-            for field in column_schema
-            if field.get("header") or field.get("key")
-        ]
-        class_suffix = "All_Classes" if class_filter == "All" else f"Class_{safe_download_name(class_filter)}"
-        base_filename = f"{safe_download_name(school_display_name(school_id))}_{class_suffix}_Students"
-
-        if export_format == "csv":
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", newline="", encoding="utf-8-sig")
-            with tmp:
-                writer = csv.DictWriter(tmp, fieldnames=headers)
-                writer.writeheader()
-                writer.writerows(flattened)
-            return FileResponse(
-                tmp.name,
-                media_type="text/csv",
-                filename=f"{base_filename}.csv",
-                background=BackgroundTask(remove_temp_file, tmp.name),
-            )
-
-        if export_format == "xls":
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xls", mode="w", encoding="utf-8")
-            with tmp:
-                tmp.write("<html><head><meta charset='utf-8'></head><body><table>")
-                tmp.write("<tr>" + "".join(f"<th>{html.escape(str(h))}</th>" for h in headers) + "</tr>")
-                for row in flattened:
-                    cells = "".join(
-                        f"<td{EXCEL_TEXT_CELL_STYLE if is_date_like_header(h) else ''}>"
-                        f"{html.escape(str(row.get(h, '') or ''))}</td>"
-                        for h in headers
-                    )
-                    tmp.write(f"<tr>{cells}</tr>")
-                tmp.write("</table></body></html>")
-            return FileResponse(
-                tmp.name,
-                media_type="application/vnd.ms-excel",
-                filename=f"{base_filename}.xls",
-                background=BackgroundTask(remove_temp_file, tmp.name),
-            )
-
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-        tmp.close()
-        pd.DataFrame(flattened, columns=headers).to_excel(tmp.name, index=False, engine="openpyxl")
-
-        # Pin date columns to Text so Excel shows them exactly as written.
-        workbook = load_workbook(tmp.name)
-        sheet = workbook.active
-        date_columns = [cell.column for cell in sheet[1] if is_date_like_header(cell.value)]
-        for column in date_columns:
-            for (cell,) in sheet.iter_rows(min_col=column, max_col=column, min_row=2):
-                cell.number_format = "@"
-        workbook.save(tmp.name)
-
-        return FileResponse(
-            tmp.name,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=f"{base_filename}.xlsx",
-            background=BackgroundTask(remove_temp_file, tmp.name),
+@app.post("/export-file/{school_id}")
+async def export_selected_students_file(
+    school_id: str,
+    request: Request,
+    payload: Optional[ExportRequest] = None,
+):
+    """Exports exactly the students the dashboard is showing: the current
+    selection if there is one, otherwise whatever the search and class filter
+    have narrowed the table down to."""
+    verify_admin(request)
+    try:
+        payload = payload or ExportRequest()
+        return build_export_file(
+            school_id,
+            file_format=payload.file_format,
+            class_filter=payload.class_filter,
+            student_ids=payload.student_ids,
         )
     except HTTPException:
         raise
