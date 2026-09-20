@@ -85,6 +85,20 @@ class TestFormatDob:
         back_to_db = format_dob_for_db(dict(frontend))
         assert back_to_db["dob"] == "2010-05-15"
 
+    def test_format_dob_excel_safe_uses_double_dash(self):
+        """Only the Excel/CSV export keeps the doubled separator"""
+        from main import format_dob_for_frontend
+        assert format_dob_for_frontend({"dob": "2021-03-06"})["dob"] == "06-03-2021"
+        assert format_dob_for_frontend({"dob": "2021-03-06"}, excel_safe=True)["dob"] == "06--03--2021"
+
+    def test_format_dob_custom_data_date_field(self):
+        """Date-like custom_data fields (typed as DD-MM-YYYY) use the display format"""
+        from main import format_dob_for_frontend
+        student = {"dob": "2021-03-06", "custom_data": {"admission_date": "15-05-2010"}}
+        result = format_dob_for_frontend(student)
+        assert result["custom_data"]["admission_date"] == "15-05-2010"
+        assert format_dob_for_frontend(student, excel_safe=True)["custom_data"]["admission_date"] == "15--05--2010"
+
 
 class TestPhotoDownloadFilename:
     """Tests for photo filenames written inside downloaded ZIP archives"""
@@ -371,6 +385,17 @@ class TestAPIEndpoints:
             from fastapi.testclient import TestClient
             client = TestClient(app)
             response = client.get("/download-photos/fake-id")
+            assert response.status_code == 401
+        except Exception:
+            pytest.skip("Server dependencies not available for integration test")
+
+    def test_download_selected_photos_no_auth(self):
+        """POST /download-photos/fake-id without auth should fail"""
+        try:
+            from main import app
+            from fastapi.testclient import TestClient
+            client = TestClient(app)
+            response = client.post("/download-photos/fake-id", json={"student_ids": ["abc"]})
             assert response.status_code == 401
         except Exception:
             pytest.skip("Server dependencies not available for integration test")

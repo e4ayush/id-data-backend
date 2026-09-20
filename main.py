@@ -18,7 +18,7 @@ import string
 import time
 from database import supabase
 from PIL import Image
-from typing import List
+from typing import List, Optional
 
 SCHEMA_KEY = "__bizera_column_schema"
 ORIGINAL_PHOTO_FILENAME_KEY = "_original_photo_filename"
@@ -148,19 +148,24 @@ def display_header_for_key(key):
         str(key).replace("_", " ").title()
     )
 
-def format_dob_for_frontend(student):
-    """Converts DB YYYY-MM-DD to DD--MM--YYYY for display/export to prevent Excel auto-format"""
+def format_dob_for_frontend(student, excel_safe=False):
+    """Converts DB YYYY-MM-DD to DD-MM-YYYY for display.
+
+    When excel_safe is True the separators are doubled (DD--MM--YYYY) so that
+    Excel treats the value as text instead of auto-converting it into a date.
+    """
     import re
+    date_format = "%d--%m--%Y" if excel_safe else "%d-%m-%Y"
     # 1. Format core dob field
     dob = student.get("dob")
     if dob and str(dob).strip():
         try:
-            # Standardize separators to single dash first, then format to double dash
+            # Standardize separators to single dash first, then apply the output format
             clean_val = re.sub(r'[\.\/\\\-]+', '-', str(dob))
-            student["dob"] = pd.to_datetime(clean_val).strftime("%d--%m--%Y")
+            student["dob"] = pd.to_datetime(clean_val).strftime(date_format)
         except Exception:
             pass
-            
+
     # 2. Aggressively format any other fields that look like dates in custom_data
     custom_data = student.get("custom_data")
     if isinstance(custom_data, dict):
@@ -170,7 +175,7 @@ def format_dob_for_frontend(student):
                 if v and str(v).strip() and len(str(v)) >= 8:
                     try:
                         clean_v = re.sub(r'[\.\/\\\-]+', '-', str(v))
-                        student["custom_data"][k] = pd.to_datetime(clean_v, dayfirst=True).strftime("%d--%m--%Y")
+                        student["custom_data"][k] = pd.to_datetime(clean_v, dayfirst=True).strftime(date_format)
                     except Exception:
                         pass
     return student
@@ -416,6 +421,10 @@ class SchoolCreate(BaseModel):
 
 class BulkDeleteRequest(BaseModel):
     ids: List[str]
+
+class PhotoDownloadRequest(BaseModel):
+    filename_column: Optional[str] = None
+    student_ids: Optional[List[str]] = None
 
 def generate_password(length=10):
     """Generates a random 10-character password"""
@@ -1427,7 +1436,7 @@ async def export_students_file(
     verify_admin(request)
     try:
         response = supabase.table("students").select("*").eq("school_id", school_id).order("class").execute()
-        students = [format_dob_for_frontend(s) for s in response.data]
+        students = [format_dob_for_frontend(s, excel_safe=True) for s in response.data]
         if class_filter and class_filter != "All":
             students = [s for s in students if str(s.get("class") or "").strip() == class_filter]
 
@@ -1496,59 +1505,82 @@ async def export_students_file(
         print(f"Export File Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to export student file. Please try again.")
 
+def build_photos_zip(school_id: str, filename_column: str = None, student_ids: List[str] = None):
+    """Packages student photos into a ZIP. Limits photos to student_ids when provided."""
+    response = supabase.table("students").select("*").eq("school_id", school_id).execute()
+    students = response.data or []
+
+    if student_ids:
+        wanted = set(student_ids)
+        students = [s for s in students if s.get("id") in wanted]
+
+    def zip_photo_name(s):
+        if filename_column:
+            if filename_column in CORE_EXPORT_FIELDS:
+                requested_value = s.get(filename_column)
+            elif filename_column == "photo":
+                requested_value = (s.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
+                if not requested_value:
+                    requested_value = strip_file_extension(photo_export_name(s))
+            else:
+                requested_value = (s.get("custom_data") or {}).get(filename_column)
+
+            if requested_value:
+                return photo_download_filename(requested_value)
+
+        return photo_download_filename(photo_export_name(s))
+
+    def download_single_photo(s):
+        url = s.get("photo_url")
+        if not url: return None
+        filename_in_db = url.split("/")[-1].split("?")[0]
+        try:
+            photo_bytes = supabase.storage.from_("student-photos").download(filename_in_db)
+            return (zip_photo_name(s), photo_bytes)
+        except Exception as e:
+            print(f"Error downloading {filename_in_db}: {e}")
+            return None
+
+    students_with_photos = [s for s in students if s.get("photo_url")]
+    if not students_with_photos:
+        detail = "No photos available for the selected students" if student_ids else "No photos available for this school"
+        raise HTTPException(status_code=404, detail=detail)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.close()
+    with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            for res in executor.map(download_single_photo, students_with_photos):
+                if res is not None:
+                    zf.writestr(res[0], res[1])
+
+    scope_suffix = "_selected" if student_ids else ""
+    return FileResponse(
+        tmp.name,
+        media_type="application/zip",
+        filename=f"photos_{safe_download_name(school_id)}{scope_suffix}.zip",
+        background=BackgroundTask(remove_temp_file, tmp.name),
+    )
+
 @app.get("/download-photos/{school_id}")
 async def download_photos(school_id: str, request: Request, filename_column: str = None):
     """Download a ZIP file of all photos for a school"""
     verify_admin(request)
     try:
-        response = supabase.table("students").select("*").eq("school_id", school_id).execute()
-        students = response.data or []
+        return build_photos_zip(school_id, filename_column)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Download Photos Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to securely package your photos. Please try again.")
 
-        def zip_photo_name(s):
-            if filename_column:
-                if filename_column in CORE_EXPORT_FIELDS:
-                    requested_value = s.get(filename_column)
-                elif filename_column == "photo":
-                    requested_value = (s.get("custom_data") or {}).get(ORIGINAL_PHOTO_FILENAME_KEY, "")
-                    if not requested_value:
-                        requested_value = strip_file_extension(photo_export_name(s))
-                else:
-                    requested_value = (s.get("custom_data") or {}).get(filename_column)
-
-                if requested_value:
-                    return photo_download_filename(requested_value)
-
-            return photo_download_filename(photo_export_name(s))
-
-        def download_single_photo(s):
-            url = s.get("photo_url")
-            if not url: return None
-            filename_in_db = url.split("/")[-1].split("?")[0]
-            try:
-                photo_bytes = supabase.storage.from_("student-photos").download(filename_in_db)
-                return (zip_photo_name(s), photo_bytes)
-            except Exception as e:
-                print(f"Error downloading {filename_in_db}: {e}")
-                return None
-
-        students_with_photos = [s for s in students if s.get("photo_url")]
-        if not students_with_photos:
-            raise HTTPException(status_code=404, detail="No photos available for this school")
-
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        tmp.close()
-        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                for res in executor.map(download_single_photo, students_with_photos):
-                    if res is not None:
-                        zf.writestr(res[0], res[1])
-
-        return FileResponse(
-            tmp.name,
-            media_type="application/zip",
-            filename=f"photos_{safe_download_name(school_id)}.zip",
-            background=BackgroundTask(remove_temp_file, tmp.name),
-        )
+@app.post("/download-photos/{school_id}")
+async def download_selected_photos(school_id: str, request: Request, payload: Optional[PhotoDownloadRequest] = None):
+    """Download a ZIP file of photos for the selected students only"""
+    verify_admin(request)
+    try:
+        payload = payload or PhotoDownloadRequest()
+        return build_photos_zip(school_id, payload.filename_column, payload.student_ids)
     except HTTPException:
         raise
     except Exception as e:
