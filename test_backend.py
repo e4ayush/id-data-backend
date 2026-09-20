@@ -400,6 +400,17 @@ class TestAPIEndpoints:
         except Exception:
             pytest.skip("Server dependencies not available for integration test")
 
+    def test_export_selected_no_auth(self):
+        """POST /export-file/fake-id without auth should fail"""
+        try:
+            from main import app
+            from fastapi.testclient import TestClient
+            client = TestClient(app)
+            response = client.post("/export-file/fake-id", json={"student_ids": ["abc"]})
+            assert response.status_code == 401
+        except Exception:
+            pytest.skip("Server dependencies not available for integration test")
+
     def test_export_students_no_auth(self):
         """GET /export-students/fake-id without auth should fail"""
         try:
