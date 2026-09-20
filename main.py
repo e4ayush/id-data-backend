@@ -18,6 +18,7 @@ import string
 import time
 from database import supabase
 from PIL import Image
+from openpyxl import load_workbook
 from typing import List, Optional
 
 SCHEMA_KEY = "__bizera_column_schema"
@@ -340,6 +341,20 @@ def cleanup_upload_progress():
 def safe_download_name(value):
     safe = "".join(c for c in str(value or "").strip() if c.isalnum() or c in ('-', '_', ' '))
     return safe.strip() or "download"
+
+# Tells Excel an HTML-exported cell is text, so it stops guessing it is a date.
+EXCEL_TEXT_CELL_STYLE = " style=\"mso-number-format:'\\@'\""
+
+def is_date_like_header(header):
+    label = str(header or "").lower()
+    return "date" in label or "dob" in label or "birth" in label
+
+def school_display_name(school_id):
+    try:
+        response = supabase.table("schools").select("name").eq("id", school_id).single().execute()
+        return (response.data or {}).get("name") or school_id
+    except Exception:
+        return school_id
 
 def remove_temp_file(path):
     try:
@@ -734,56 +749,66 @@ async def upload_excel(school_id: str, file: UploadFile = File(...), request: Re
                 detail={"message": "Validation failed", "errors": validation_errors}
             )
 
-        # ── Safe Upsert Strategy ──────────────────────────────────────────
-        # Split students into those with an admission_number (can be matched)
-        # and those without (must be inserted fresh).
-        #
-        # For students WITH admission_number:
-        #   - If the school already has a matching record → UPDATE it (keeps photo!)
-        #   - If no match → INSERT as new
-        # For students WITHOUT admission_number → INSERT as new
-        #
-        # ── Bulletproof Overwrite Strategy ────────────────────────────────
-        # Fetch existing students for this school
-        existing = supabase.table("students").select("id, name, class, admission_number, photo_url").eq("school_id", school_id).execute()
+        # ── Overwrite Strategy ────────────────────────────────────────────
+        # Students that already exist (matched by admission number, falling back
+        # to name + class) are UPDATED with the values from the sheet, so a
+        # corrected re-upload actually takes effect. Photos are preserved.
+        # Everyone else is inserted.
+        existing = supabase.table("students").select("*").eq("school_id", school_id).execute()
         existing_data = existing.data or []
-        
+
         # Build lookup maps
         by_adm = {r["admission_number"]: r for r in existing_data if r.get("admission_number")}
         by_name_class = {f"{str(r['name']).lower().strip()}|{str(r['class']).lower().strip()}": r for r in existing_data}
 
-        skipped = 0
         to_insert = []
+        to_update = []
 
         for student in student_data:
             match = None
             adm = student.get("admission_number")
             name_key = f"{str(student.get('name')).lower().strip()}|{str(student.get('class')).lower().strip()}"
-            
+
             # 1. Match by Admission Number (Highest priority)
             if adm and adm in by_adm:
                 match = by_adm[adm]
             # 2. Fallback: Match by Name + Class
             elif name_key in by_name_class:
                 match = by_name_class[name_key]
-            
+
             if match:
-                # SKIP
-                skipped += 1
+                # Start from the existing row so columns the sheet does not
+                # mention (photo_url, created_at, ...) keep their current values.
+                payload = dict(match)
+                payload.update({k: v for k, v in student.items() if k != "school_id"})
+                existing_custom = match.get("custom_data") or {}
+                sheet_custom = student.get("custom_data") or {}
+                if isinstance(existing_custom, dict) and isinstance(sheet_custom, dict):
+                    payload["custom_data"] = {**existing_custom, **sheet_custom}
+                payload = preserve_schema_in_custom_data(payload, existing_custom)
+                to_update.append(payload)
             else:
                 student["school_id"] = school_id
                 to_insert.append(student)
 
-        # Batch insert in chunks of 100 (avoids N individual round-trips)
+        # Batch in chunks of 100 (avoids N individual round-trips)
         CHUNK = 100
         for i in range(0, len(to_insert), CHUNK):
             supabase.table("students").insert(to_insert[i:i+CHUNK]).execute()
+        # default_to_null=False so columns absent from the payload are left alone;
+        # otherwise the upsert would blank out photo_url on every updated row.
+        for i in range(0, len(to_update), CHUNK):
+            supabase.table("students").upsert(
+                to_update[i:i+CHUNK], on_conflict="id", default_to_null=False
+            ).execute()
+
         inserted = len(to_insert)
+        updated = len(to_update)
 
         return {
-            "message": f"Upload complete: {inserted} added, {skipped} skipped (duplicates).",
+            "message": f"Upload complete: {inserted} added, {updated} updated.",
             "inserted": inserted,
-            "skipped": skipped,
+            "updated": updated,
         }
 
     except HTTPException as he:
@@ -1435,8 +1460,12 @@ async def export_students_file(
 ):
     verify_admin(request)
     try:
+        export_format = (file_format or "xlsx").lower()
+
         response = supabase.table("students").select("*").eq("school_id", school_id).order("class").execute()
-        students = [format_dob_for_frontend(s, excel_safe=True) for s in response.data]
+        # Excel type-guesses plain-text CSV, so only that format keeps the doubled
+        # separator. XLSX/XLS carry real types and get a normal DD-MM-YYYY.
+        students = [format_dob_for_frontend(s, excel_safe=(export_format == "csv")) for s in response.data]
         if class_filter and class_filter != "All":
             students = [s for s in students if str(s.get("class") or "").strip() == class_filter]
 
@@ -1459,8 +1488,7 @@ async def export_students_file(
             if field.get("header") or field.get("key")
         ]
         class_suffix = "All_Classes" if class_filter == "All" else f"Class_{safe_download_name(class_filter)}"
-        base_filename = f"students_{safe_download_name(school_id)}_{class_suffix}"
-        export_format = (file_format or "xlsx").lower()
+        base_filename = f"{safe_download_name(school_display_name(school_id))}_{class_suffix}_Students"
 
         if export_format == "csv":
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", newline="", encoding="utf-8-sig")
@@ -1481,7 +1509,12 @@ async def export_students_file(
                 tmp.write("<html><head><meta charset='utf-8'></head><body><table>")
                 tmp.write("<tr>" + "".join(f"<th>{html.escape(str(h))}</th>" for h in headers) + "</tr>")
                 for row in flattened:
-                    tmp.write("<tr>" + "".join(f"<td>{html.escape(str(row.get(h, '') or ''))}</td>" for h in headers) + "</tr>")
+                    cells = "".join(
+                        f"<td{EXCEL_TEXT_CELL_STYLE if is_date_like_header(h) else ''}>"
+                        f"{html.escape(str(row.get(h, '') or ''))}</td>"
+                        for h in headers
+                    )
+                    tmp.write(f"<tr>{cells}</tr>")
                 tmp.write("</table></body></html>")
             return FileResponse(
                 tmp.name,
@@ -1493,6 +1526,16 @@ async def export_students_file(
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
         tmp.close()
         pd.DataFrame(flattened, columns=headers).to_excel(tmp.name, index=False, engine="openpyxl")
+
+        # Pin date columns to Text so Excel shows them exactly as written.
+        workbook = load_workbook(tmp.name)
+        sheet = workbook.active
+        date_columns = [cell.column for cell in sheet[1] if is_date_like_header(cell.value)]
+        for column in date_columns:
+            for (cell,) in sheet.iter_rows(min_col=column, max_col=column, min_row=2):
+                cell.number_format = "@"
+        workbook.save(tmp.name)
+
         return FileResponse(
             tmp.name,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1558,7 +1601,7 @@ def build_photos_zip(school_id: str, filename_column: str = None, student_ids: L
     return FileResponse(
         tmp.name,
         media_type="application/zip",
-        filename=f"photos_{safe_download_name(school_id)}{scope_suffix}.zip",
+        filename=f"photos_{safe_download_name(school_display_name(school_id))}{scope_suffix}.zip",
         background=BackgroundTask(remove_temp_file, tmp.name),
     )
 
